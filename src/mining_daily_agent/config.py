@@ -28,7 +28,11 @@ DEFAULT_MCP_SERVERS: Final[tuple[tuple[str, str], ...]] = (
     ("price", "mining_daily_agent.servers.price_server"),
 )
 #: 单次工具调用的默认超时秒数。
-DEFAULT_MCP_CALL_TIMEOUT_SECONDS: Final = 30.0
+#:
+#: 定得比直觉宽，是因为 `pdf.extract_resources` 要下载并逐页解析真实年报：内置的
+#: Pilbara Minerals 年报 15.6 MB / 186 页，实测下载 26.6 秒 + 文本抽取 29.1 秒 ≈ 56 秒，
+#: 30 秒必然被切断、拿不到任何资源量。
+DEFAULT_MCP_CALL_TIMEOUT_SECONDS: Final = 120.0
 #: 简报输出目录的默认值，可经 REPORTS_DIR 覆盖。
 DEFAULT_REPORTS_DIR: Final = Path("reports")
 

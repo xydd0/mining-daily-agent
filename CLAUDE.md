@@ -152,9 +152,21 @@ src/mining_daily_agent/
   Pilbara Minerals 2025 年报）→ 线索词命中的新闻（保底，当前不可达）。第二级必须
   排在线索词前面——Google News 的条目几乎不是 `.pdf`，线索词命中的多是普通新闻页，
   喂给解析器只会失败再降级，等于挑到哪条看运气。
-- **大文档会撞上工具超时**：内置年报 15.6 MB / 186 页，下载 27 秒 + 抽文本 29 秒 ≈ 56 秒，
-  超过 `MCP_CALL_TIMEOUT_SECONDS` 默认的 30 秒，会在 `client` 层被切断。要拿到资源量
-  需调大该值。降级链路只保证失败被诚实记录，不保证能拿到数据。
+- **`MCP_CALL_TIMEOUT_SECONDS` 默认 120 秒**，不是随手定的：内置年报 15.6 MB / 186 页，
+  实测下载 26.6 秒 + 抽文本 29.1 秒 ≈ 56 秒，早先的 30 秒必然切断、拿不到任何资源量。
+  调小前请先想清楚 PDF 这条链路。
+- **类别只认首字母大写**（`Measured`/`Indicated`/`Inferred` 或全大写），刻意不加
+  IGNORECASE。实测一份真实年报：87 条抽取里 80 条来自 "measured at fair value"、
+  "where indicated in the Annual Report" 这类会计正文，而资源表里的类别词全部大写。
+  这一条把误报从 87 条压到 16 条，真表行一条不少。
+- **吨位有量级校验**（`TONNAGE_MIN_T` / `TONNAGE_MAX_T`，1e5–1e10 吨）。典型值是 1e8
+  量级（349 Mt = 3.49e8），区间必须覆盖到那里——别照直觉定成 1e7 上限。
+- **表头单位只沿用到紧邻的下一块**。早先一路沿用到底，"Tonnes (Mt)" 会泄漏进后面几十块
+  正文，把任意数字都变成吨位。
+- **按类别逐行求和会重复计入**：JORC 表同时列分块小计与全矿总计（In-situ 349 +
+  Stockpiles 8 + 总计 356 是同一份资源量）。`analyze` 因此与
+  `ResourceReport.self_reported_total_t` 交叉核对，求和超出 1.2 倍即以自报合计为准
+  并留风险提示。实测把 760 Mt 的 Indicated 拉回真值 445 Mt。
 
 ### 价格工具的代理品种陷阱（重要）
 

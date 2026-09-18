@@ -27,6 +27,7 @@ from mining_daily_agent.client.pool import (
     UnknownServerError,
 )
 from mining_daily_agent.config import (
+    DEFAULT_MCP_CALL_TIMEOUT_SECONDS,
     ConfigError,
     McpClientConfig,
     McpServerSpec,
@@ -443,7 +444,7 @@ def test_mcp_config_defaults_to_the_three_project_servers(
     assert [spec.name for spec in config.servers] == ["news", "pdf", "price"]
     assert [spec.args[-1] for spec in config.servers] == list(MODULES.values())
     assert all(spec.args[-2] == "-m" for spec in config.servers)
-    assert config.call_timeout_seconds == 30.0
+    assert config.call_timeout_seconds == DEFAULT_MCP_CALL_TIMEOUT_SECONDS == 120.0
 
 
 def test_mcp_config_is_overridable_from_the_environment(
