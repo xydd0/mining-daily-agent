@@ -42,7 +42,12 @@ from mining_daily_agent.agent.nodes import (
     slugify,
 )
 from mining_daily_agent.agent.state import FetchPlan
-from mining_daily_agent.config import Config, default_report_url, reports_dir
+from mining_daily_agent.config import (
+    DEFAULT_REPORT_URL_BUILTIN,
+    Config,
+    default_report_url,
+    reports_dir,
+)
 from mining_daily_agent.models.news import NewsItem
 from mining_daily_agent.models.prices import PricePoint
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
@@ -194,6 +199,18 @@ def _report_payload() -> dict[str, object]:
             ),
         ],
     ).model_dump(mode="json")
+
+
+def _plain_news_item(**overrides: object) -> dict[str, object]:
+    """一条不含 ``.pdf`` 链接、也不带 report/resource 线索词的普通新闻。"""
+    defaults: dict[str, object] = {
+        "title": "Some unrelated headline",
+        "url": "https://example.com/plain-page",
+        "source": "Example",
+        "published_at": datetime(2026, 9, 18, tzinfo=UTC),
+        "summary": "Nothing about resources.",
+    }
+    return NewsItem.model_validate({**defaults, **overrides}).model_dump(mode="json")
 
 
 def _responses() -> dict[tuple[str, str], object]:
@@ -360,30 +377,80 @@ async def test_real_data_is_not_marked_as_degraded(
     assert DEGRADED_MARK not in document
 
 
-async def test_missing_report_url_is_reported_as_a_risk(
+async def test_default_annual_report_beats_hint_matched_news(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """新闻里没有 PDF 线索且未配置兜底 URL 时，跳过取数并留下提示，而不是编造数据。"""
+    """有确定性年报时，绝不能退回线索词命中的新闻页。
+
+    Google News 返回的条目几乎不是 .pdf，线索词命中的多是普通新闻网页（矿企名里带
+    "Resources" 极常见）。把它喂给 PDF 解析器只会解析失败再降级成 mock——挑到哪条
+    全看运气，每次结果都可能不同。这是本项目修过的一个真实缺陷。
+    """
     responses = _responses()
     responses[("news", "search")] = _ok(
         [
             NewsItem(
-                title="Some unrelated headline",
-                url="https://example.com/plain-page",
+                title="Raiden Resources eyes lithium exploration",
+                url="https://example.com/news-page",
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
-                summary="Nothing about resources.",
+                summary="Exploration update.",
             ).model_dump(mode="json")
         ]
     )
-    llm = _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
     pool = _FakePool(responses)
 
     await run_daily_brief(TOPIC, pool=pool)
 
-    assert ("pdf", "extract_resources") not in {(server, tool) for server, tool, _ in pool.calls}
-    prompt = llm.prompts[-1]
-    assert "DEFAULT_REPORT_URL" in prompt, "风险提示应传给合成节点"
+    pdf_call = next(call for call in pool.calls if call[:2] == ("pdf", "extract_resources"))
+    assert pdf_call[2] == {"pdf_url": DEFAULT_REPORT_URL_BUILTIN}
+
+
+async def test_configured_report_url_beats_the_builtin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEFAULT_REPORT_URL", "https://example.com/custom-annual.pdf")
+    responses = _responses()
+    # 新闻里不能有 .pdf 链接，否则第一级就命中了，到不了年报这一级。
+    responses[("news", "search")] = _ok([_plain_news_item()])
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    pool = _FakePool(responses)
+
+    await run_daily_brief(TOPIC, pool=pool)
+
+    pdf_call = next(call for call in pool.calls if call[:2] == ("pdf", "extract_resources"))
+    assert pdf_call[2] == {"pdf_url": "https://example.com/custom-annual.pdf"}
+
+
+async def test_hint_matched_news_is_the_last_resort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """保底分支：只有在没有确定性年报时才回落到线索词命中的新闻。
+
+    内置默认值存在时这条分支不可达，所以这里显式把 default_report_url 打成空串来覆盖它
+    ——保留这段逻辑，是为了让「确定性优先」这条原则写死在代码里而不是靠默认值巧合成立。
+    """
+    monkeypatch.setattr(nodes_module, "default_report_url", lambda: "")
+    responses = _responses()
+    responses[("news", "search")] = _ok(
+        [
+            NewsItem(
+                title="Some company annual resource report",
+                url="https://example.com/resource-summary",
+                source="Example",
+                published_at=datetime(2026, 9, 18, tzinfo=UTC),
+                summary="Resource statement.",
+            ).model_dump(mode="json")
+        ]
+    )
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    pool = _FakePool(responses)
+
+    await run_daily_brief(TOPIC, pool=pool)
+
+    pdf_call = next(call for call in pool.calls if call[:2] == ("pdf", "extract_resources"))
+    assert pdf_call[2] == {"pdf_url": "https://example.com/resource-summary"}
 
 
 # --- 场景 3：LLM 计划解析失败回退默认计划 ------------------------------------
@@ -566,6 +633,102 @@ async def test_analyze_summarises_price_and_tonnage() -> None:
     assert any("Inferred 合计 89.0 Mt" in item for item in highlights)
 
 
+async def test_analyze_replaces_a_double_counted_sum_with_the_self_reported_total() -> None:
+    """JORC 表同时列分块小计与全矿总计，逐行相加会把同一份资源量算两遍。
+
+    实测一份真实年报把 356 Mt 的 Indicated 加成 760 Mt。报告自报合计更小时以自报为准，
+    并且必须留下提示——否则简报会把重复计算的数字当事实呈现。
+    """
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport(
+        project_name="Pilgangoora",
+        source_url=REPORT_URL,
+        fetched_at=datetime(2026, 9, 18, tzinfo=UTC),
+        resources=[
+            ResourceItem(
+                category=ResourceCategory.INDICATED,
+                commodity="Li2O",
+                tonnage_t=349e6,
+                grade=1.29,
+                grade_unit="%",
+            ),
+            ResourceItem(
+                category=ResourceCategory.INDICATED,
+                commodity="Li2O",
+                tonnage_t=356e6,
+                grade=1.29,
+                grade_unit="%",
+            ),
+        ],
+        # 逐条求和 705 Mt，自报合计 445 Mt → 明显重复
+        self_reported_total_t=445e6,
+    )
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("445.0 Mt" in item for item in highlights), "应以自报合计为准"
+    assert not any("705" in item for item in highlights), "不应再把重复求和高亮出去"
+    notes = result["risk_notes"]
+    assert isinstance(notes, list)
+    assert any("重复计入" in note for note in notes)
+
+
+async def test_analyze_keeps_per_category_totals_when_they_agree() -> None:
+    """自报合计与求和一致时不该误报重复——正常报告仍要给出分类别数字。"""
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 389e6  # 与逐条求和（214+86+89）一致
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload)
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("Indicated 合计 300.0 Mt" in item for item in highlights)
+    assert result["risk_notes"] == []
+
+
+async def test_analyze_tolerates_a_difference_within_five_percent() -> None:
+    """±5% 是容差分界线：容差内的偏差不该被当成重复计入。
+
+    JORC 表逐行四舍五入到 0.1 Mt，求和与自报合计差几个百分点是常态。为此把整张表
+    判为不可信、只报一个总数，反而丢掉了分类别信息。
+    """
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 400e6  # 求和 389 Mt，偏差 -2.8%
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload)
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("Indicated 合计 300.0 Mt" in item for item in highlights), "容差内仍给分类别数字"
+    assert result["risk_notes"] == []
+
+
+async def test_analyze_falls_back_to_the_reported_total_beyond_the_tolerance() -> None:
+    """一旦越过 ±5%，求和值不再可信，改报自报合计并说明原因。"""
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 360e6  # 求和 389 Mt，偏差 +8.1%
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload)
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("自报资源量合计 360.0 Mt" in item for item in highlights)
+    assert not any("389" in item for item in highlights), "可疑的求和值不该被高亮出去"
+    notes = result["risk_notes"]
+    assert isinstance(notes, list)
+    assert any("重复计入" in note and "+8.1%" in note for note in notes), (
+        f"提示里要写明偏差与容差，实得 {notes}"
+    )
+
+
 async def test_analyze_flags_risk_keywords_in_headlines() -> None:
     state = initial_state(TOPIC)
     state["news"] = [
@@ -622,12 +785,12 @@ def test_reports_dir_defaults_to_reports_relative_dir(
     assert reports_dir() == Path("reports")
 
 
-def test_default_report_url_is_empty_unless_configured(
+def test_default_report_url_falls_back_to_the_builtin_annual_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """故意没有非空默认值——硬编码一个假地址只会让 PDF 取数每次都失败。"""
+    """未配置时用内置年报——有确定性来源，才不至于每次挑到哪条新闻全看运气。"""
     monkeypatch.delenv("DEFAULT_REPORT_URL", raising=False)
-    assert default_report_url() == ""
+    assert default_report_url() == DEFAULT_REPORT_URL_BUILTIN
 
     monkeypatch.setenv("DEFAULT_REPORT_URL", " https://example.com/annual.pdf ")
     assert default_report_url() == "https://example.com/annual.pdf"

@@ -22,6 +22,7 @@ import httpx
 import pdfplumber
 
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
+from mining_daily_agent.providers import BROWSER_USER_AGENT
 from mining_daily_agent.providers.pdf.base import PdfProvider
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,26 @@ MAX_SNIPPET_CHARS: Final = 1000
 #: 识别不出矿种时的占位值。
 UNKNOWN_COMMODITY: Final = "unknown"
 
+#: 单条目吨位的可信区间（吨）。超出即视为正则误配，丢弃并只留在 raw_snippets 里。
+#:
+#: 下界 1e5 t（0.1 Mt）——真实资源量很少小于这个量级；上界 1e10 t（1 万 Mt）——
+#: 全球最大的矿床也在其下。注意典型值是 1e8 量级（如 Pilgangoora Indicated 349 Mt
+#: = 3.49e8 t），所以区间必须覆盖到那里。
+TONNAGE_MIN_T: Final = 1e5
+TONNAGE_MAX_T: Final = 1e10
+
 _KEYWORD_RE: Final = re.compile(
     r"\b(?:mineral\s+resources?|measured|indicated|inferred)\b",
     re.IGNORECASE,
 )
-_CATEGORY_RE: Final = re.compile(r"\b(?P<category>measured|indicated|inferred)\b", re.IGNORECASE)
+# 类别**只认首字母大写或全大写**，刻意不加 IGNORECASE。
+# 实测一份真实年报（Pilbara Minerals 2025）：87 条抽取里有 80 条来自这种误报——
+# 会计与绩效正文里的 "measured at fair value"、"where indicated in the Annual Report"、
+# "measured against the Baseline"。而资源表里的 15 处类别词**全部**是首字母大写。
+# 这一条改动的效果：87 条 → 16 条，且真表的行一条不少。
+_CATEGORY_RE: Final = re.compile(
+    r"\b(?P<category>Measured|Indicated|Inferred|MEASURED|INDICATED|INFERRED)\b"
+)
 # 单位按长度降序排列，避免 "Mt" 被 "t" 抢先匹配。
 _TONNAGE_RE: Final = re.compile(
     r"(?P<value>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>million\s+tonnes|Mt|kt|tonnes|t)\b",
@@ -80,6 +96,20 @@ _PAREN_GRADE_UNIT_RE: Final = re.compile(r"\(\s*(?P<unit>g/t|%)\s*[^)]*\)", re.I
 #: 不带单位的裸数字，用于上述表格形态。
 _BARE_NUMBER_RE: Final = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
+# --- 分块与库存 -------------------------------------------------------------
+#: 行内「边界品位说明」的括号组，形如 ``(≥0.2% Li2O)``、``(0.3% Li2O cut-off)``。
+#: 组里的百分比是**筛选阈值**（用什么品位下限圈的矿），不是矿体品位——实测不排除时
+#: 会把 Pilgangoora 的 1.33% Li2O 记成 0.2%。
+_CUTOFF_NOTE_RE: Final = re.compile(
+    r"\([^)]*(?:[≥≤<>]|cut[\s\-]?off|minimum)[^)]*\)",
+    re.IGNORECASE,
+)
+#: 矿石库存关键词。``Stockpiles`` 分块是已采出矿石的堆存量（JORC 表里单列），
+#: 属于库存而不属于**原地**矿产资源量，整块剔除。
+_STOCKPILE_RE: Final = re.compile(r"\bstockpiles?\b", re.IGNORECASE)
+#: 自报合计行的行首写法（JORC 表里是 "Sub total" 与 "Total"）。
+_TOTAL_ROW_RE: Final = re.compile(r"^\s*(?:Sub\s+)?total\b", re.IGNORECASE)
+
 
 @dataclass(frozen=True, slots=True)
 class _UnitHints:
@@ -96,9 +126,17 @@ class PdfFetchError(RuntimeError):
 def _http_get(url: str) -> httpx.Response:
     """发出单次 GET。
 
-    这是本模块唯一的 HTTP 接缝：超时在此统一设置，测试也在这里替换。
+    这是本模块唯一的 HTTP 接缝：超时与请求头在此统一设置，测试也在这里替换。
+
+    带浏览器 UA 作为兼容手段：**并非所有站点都需要**（pls.com 的年报、Yahoo 的行情接口
+    不带也能取到），但部分站点会对非浏览器 UA 直接 403（实测 mining.com 的文章页）。
     """
-    return httpx.get(url, timeout=PDF_TIMEOUT_SECONDS, follow_redirects=True)
+    return httpx.get(
+        url,
+        timeout=PDF_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        headers={"User-Agent": BROWSER_USER_AGENT, "Accept": "application/pdf,*/*"},
+    )
 
 
 def _validate_pdf_response(response: httpx.Response) -> None:
@@ -237,59 +275,230 @@ def _resolve_tonnage(
 def _resolve_grade(
     segment: str, header_unit: str | None, consumed: tuple[int, int] | None
 ) -> tuple[float | None, str]:
-    """先按显式单位解析品位；失败时若表头给了单位，取未被吨位占用的第一个裸数字。"""
-    match = _GRADE_RE.search(segment)
-    if match is not None:
+    """先按显式单位解析品位；失败时若表头给了单位，取未被吨位占用的第一个裸数字。
+
+    **边界品位说明里的百分数不算品位**：``In-situ Measured 18 1.33 …`` 后面紧跟
+    ``(≥0.2% Li2O)``，那是筛选阈值。段内没有别的品位写法时宁可返回 None——
+    「没有品位」比「一个错的品位」诚实，下游也不会拿 0.2% 去做任何判断。
+    """
+    notes = [note.span() for note in _CUTOFF_NOTE_RE.finditer(segment)]
+    for match in _GRADE_RE.finditer(segment):
+        if any(_overlaps(match.span(), note) for note in notes):
+            continue
         return float(match.group("value")), match.group("unit").lower()
     if header_unit is None:
         return None, ""
     for number in _BARE_NUMBER_RE.finditer(segment):
         if consumed is not None and _overlaps(number.span(), consumed):
             continue
+        if any(_overlaps(number.span(), note) for note in notes):
+            continue
         return float(number.group(0).replace(",", "")), header_unit
     return None, ""
 
 
-def _items_from_block(block: str, hints: _UnitHints) -> list[ResourceItem]:
-    """在一个文本块内按类别切段，逐段抽取吨位与品位。
+def _item_from_segment(
+    category: str, segment: str, hints: _UnitHints, block: str
+) -> ResourceItem | None:
+    """把「类别词之后的那一段」解析成一条记录；解析不出可用吨位时返回 None。
 
-    每个类别关键词开启一段，段的范围是它到下一个类别关键词之间。段内优先用
-    **自带单位**的写法（``Indicated: 214 Mt @ 1.15% Li2O``）；没有自带单位时退回
-    **表头推断**：表头给了吨位单位就按它解析段内第一个裸数字，给了品位单位就取
-    其后第一个未被占用的裸数字——即 ``Indicated  214  1.15`` 配
-    ``Category  Tonnage (Mt)  Grade (% Li2O)`` 的表格形态。
+    ``category`` 必须是已经通过大小写筛选的类别词原文。
 
-    表头推断是启发式的，它假定表格列序为「吨位在前、品位在后」。
+    段内优先用**自带单位**的写法（``Indicated: 214 Mt @ 1.15% Li2O``）；没有自带单位时
+    退回**表头推断**：表头给了吨位单位就按它解析段内第一个裸数字，给了品位单位就取其后
+    第一个未被占用的裸数字——即 ``Indicated  214  1.15`` 配
+    ``Category  Tonnage (Mt)  Grade (% Li2O)`` 的表格形态。表头推断假定列序为
+    「吨位在前、品位在后」。
     """
+    tonnage_t, consumed = _resolve_tonnage(segment, hints.tonnage_unit)
+    if tonnage_t is None:
+        # 既没有显式单位、表头也没给单位：(多半是表头或叙述句) 跳过。
+        return None
+    if not TONNAGE_MIN_T <= tonnage_t <= TONNAGE_MAX_T:
+        # 量级不合理：多半是正则配到了某个无关数字。不进 resources——
+        # 宁可少给也不要给错，那段原文仍留在 raw_snippets 里供人工核对。
+        logger.debug(
+            "丢弃量级可疑的吨位：category=%s tonnage_t=%.3g 区间=[%.0e, %.0e]",
+            category,
+            tonnage_t,
+            TONNAGE_MIN_T,
+            TONNAGE_MAX_T,
+        )
+        return None
+
+    grade, grade_unit = _resolve_grade(segment, hints.grade_unit, consumed)
+    return ResourceItem(
+        category=ResourceCategory(category.capitalize()),
+        commodity=_find_commodity(segment, block),
+        tonnage_t=tonnage_t,
+        grade=grade,
+        grade_unit=grade_unit,
+    )
+
+
+def _items_from_prose(block: str, hints: _UnitHints) -> list[ResourceItem]:
+    """散文形态：一个类别词开启一段，段的范围到下一个类别词为止，**可以跨行**。"""
     matches = list(_CATEGORY_RE.finditer(block))
     items: list[ResourceItem] = []
     for index, match in enumerate(matches):
         segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(block)
-        segment = block[match.end() : segment_end]
-
-        tonnage_t, consumed = _resolve_tonnage(segment, hints.tonnage_unit)
-        if tonnage_t is None:
-            # 既没有显式单位、表头也没给单位：(多半是表头或叙述句) 跳过。
-            continue
-
-        grade, grade_unit = _resolve_grade(segment, hints.grade_unit, consumed)
-        items.append(
-            ResourceItem(
-                category=ResourceCategory(match.group("category").capitalize()),
-                commodity=_find_commodity(segment, block),
-                tonnage_t=tonnage_t,
-                grade=grade,
-                grade_unit=grade_unit,
-            )
+        item = _item_from_segment(
+            match.group("category"), block[match.end() : segment_end], hints, block
         )
+        if item is not None:
+            items.append(item)
     return items
+
+
+@dataclass(slots=True)
+class _Section:
+    """资源表里的一个分块（``In-situ`` / ``Stockpiles`` / 矿名），可带自报小计。"""
+
+    label: str | None
+    items: list[ResourceItem]
+    self_reported_total_t: float | None = None
+
+
+def _is_stockpile(label: str | None) -> bool:
+    """分块名里含 stockpile 的，是已采出矿石的堆存量，不属于**原地**矿产资源量。"""
+    return label is not None and _STOCKPILE_RE.search(label) is not None
+
+
+def _section_label(line: str, category_start: int) -> str | None:
+    """取「类别词之前的那截」当分块名；取不到返回 None。
+
+    ``In-situ Measured 18 …`` → ``In-situ``；``Stockpiles Measured 1 …`` → ``Stockpiles``。
+    而 ``Indicated 349 …`` 前面什么都没有，``(≥0.2% Li2O) Indicated 349 …`` 前面只有
+    边界品位说明——两者都不算分块名，沿用上一行的分块。
+    """
+    prefix = _CUTOFF_NOTE_RE.sub(" ", line[:category_start])
+    if not any(character.isalpha() for character in prefix):
+        return None
+    return _collapse(prefix)[:80]
+
+
+def _sections_from_table(block: str, hints: _UnitHints) -> list[_Section]:
+    """按行解析表格块，切成若干分块，并逐块记下自报小计。
+
+    一行 = 一条记录。类别词之前的文字若像分块名（``In-situ``、``Stockpiles``），
+    就开启新分块；``Sub total`` / ``Total`` 开头的行为该分块的**自报小计**，
+    并且**结束**这个分块——后面的行属于下一张表。
+
+    两条规则都是被真实年报逼出来的：
+
+    - 逐行解析：早先按「类别词到下一个类别词」跨行切段，Stockpiles 那行没有数值时
+      就会把下一行的 ``Sub total`` 数字取来当吨位；
+    - 合计行结束分块：Table 5（资源量）与 Table 6（储量）在真实年报里排在**同一个
+      文本块**里，而储量表的行用 Proved / Probable 作类别词，解析器认不出，于是
+      储量表的 ``Sub total 207.2`` 一路覆盖掉了资源量表的 ``Sub total 445``——
+      全矿口径凭空缩水一半还多。
+    """
+    sections: list[_Section] = []
+    current = _Section(label=None, items=[])
+    for line in block.splitlines():
+        matches = list(_CATEGORY_RE.finditer(line))
+        if not matches:
+            total_match = _TOTAL_ROW_RE.match(line)
+            if total_match is not None:
+                subtotal, _ = _resolve_tonnage(line[total_match.end() :], hints.tonnage_unit)
+                if subtotal is not None and TONNAGE_MIN_T <= subtotal <= TONNAGE_MAX_T:
+                    current.self_reported_total_t = subtotal
+                    sections.append(current)
+                    current = _Section(label=None, items=[])
+            continue
+        label = _section_label(line, matches[0].start())
+        if label is not None and label != current.label:
+            # 同名标签不另起分块：有的表在每一行都重复写一遍分块名。
+            sections.append(current)
+            current = _Section(label=label, items=[])
+        for index, match in enumerate(matches):
+            segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            item = _item_from_segment(
+                match.group("category"), line[match.end() : segment_end], hints, block
+            )
+            if item is not None:
+                current.items.append(item)
+    sections.append(current)
+    return [
+        section
+        for section in sections
+        if section.items or section.self_reported_total_t is not None
+    ]
+
+
+def _pick_section_items(sections: list[_Section]) -> list[ResourceItem]:
+    """从表格分块里挑出应当计入 ``resources`` 的条目。
+
+    1. 含 stockpile 的分块**整块剔除**——矿石库存不是矿产资源量；
+    2. 分块自带 ``Sub total`` / ``Total`` 时，只采信**合计最大的那一块**。JORC 表常把
+       同一份资源量按 In-situ / Stockpiles / 全矿三种口径各列一遍（实测 Pilgangoora：
+       In-situ 436 + Stockpiles 9 + 全矿 445），逐块相加得 890，正好是真实值 445 的两倍；
+    3. 一个自报合计都没有时，才把各分块逐行累加。
+    """
+    usable = [section for section in sections if not _is_stockpile(section.label)]
+    totalled = [
+        section for section in usable if section.self_reported_total_t is not None and section.items
+    ]
+    if totalled:
+        best = max(totalled, key=lambda section: section.self_reported_total_t or 0.0)
+        logger.debug(
+            "按自报合计选取分块：label=%s total_t=%.3g 候选=%d（其余分块舍弃，避免重复计入）",
+            best.label,
+            best.self_reported_total_t or 0.0,
+            len(totalled),
+        )
+        return list(best.items)
+    return [item for section in usable for item in section.items]
+
+
+def _items_from_block(block: str, hints: _UnitHints) -> list[ResourceItem]:
+    """在一个文本块内抽取条目。
+
+    表头给出了吨位单位时按**表格**解析（一行 = 一条记录，识别分块与自报合计）；
+    否则按**散文**解析（一个类别词开启一段，段可以跨行）。
+
+    这个分岔是有意的：表格才有「分块小计 / 全矿总计」这层结构，散文没有；
+    把散文套进分块逻辑只会凭空切出些不存在的分块。
+    """
+    if hints.tonnage_unit is not None:
+        return _pick_section_items(_sections_from_table(block, hints))
+    return _items_from_prose(block, hints)
+
+
+def parse_self_reported_total(text: str) -> float | None:
+    """取报告**自报**的资源量合计吨位。
+
+    JORC 资源表通常既有各分块的 "Sub total"，也有全矿的 "Total"。取其中**最大**的一个
+    即是全矿总计——总计不会小于任何分块小计。含 stockpile 的分块不参与：那是矿石库存。
+
+    这个值是交叉核对用的基准：同一份报告里「分块」与「总计」并存，按类别直接把所有
+    行相加会把同一份资源量算两遍。
+
+    ⚠️ 已知局限：若同一文本块里既有资源量表也有储量表（真实年报常把 Table 5/6 排在同一
+    页），这里的候选会混入**储量**的合计行。目前靠「取最大」侥幸躲过（资源量 445 Mt >
+    储量 207.2 Mt），但这层保障很薄——要稳妥需要先做表格区域切分。
+
+    Returns:
+        合计吨位；找不到可识别的合计行时返回 None。
+    """
+    candidates: list[float] = []
+    for block in _blocks(text):
+        hints = _header_unit_hints(block)
+        if hints.tonnage_unit is None:
+            continue
+        for section in _sections_from_table(block, hints):
+            if section.self_reported_total_t is None or _is_stockpile(section.label):
+                continue
+            candidates.append(section.self_reported_total_t)
+    return max(candidates) if candidates else None
 
 
 def parse_resource_text(text: str) -> tuple[list[ResourceItem], list[str]]:
     """从 PDF 文本中抽取资源量条目与溯源片段。
 
-    表头单位会**沿用到后续块**：PDF 文本提取常把表头与数据行切成两个块，
-    只在块内找表头会漏掉单位。
+    表头单位会**只沿用到紧邻的下一个块**：PDF 文本提取常把表头与数据行切成两块，
+    只在块内找表头会漏掉单位。但沿用范围必须限定——早先一路沿用到底，导致真表的
+    "Tonnes (Mt)" 表头泄漏进后面几十块会计正文，把那些段落里的任意数字都当成了吨位。
 
     Returns:
         ``(条目列表, 命中关键词的原文块列表)``。抽不到条目时第一个列表为空，
@@ -297,18 +506,21 @@ def parse_resource_text(text: str) -> tuple[list[ResourceItem], list[str]]:
     """
     items: list[ResourceItem] = []
     snippets: list[str] = []
-    hints = _UnitHints()
+    inherited = _UnitHints()
     for block in _blocks(text):
         # 表头块本身可能不含类别关键词，因此先取提示、再做关键词过滤。
-        block_hints = _header_unit_hints(block)
-        hints = _UnitHints(
-            block_hints.tonnage_unit or hints.tonnage_unit,
-            block_hints.grade_unit or hints.grade_unit,
+        own = _header_unit_hints(block)
+        effective = _UnitHints(
+            own.tonnage_unit or inherited.tonnage_unit,
+            own.grade_unit or inherited.grade_unit,
         )
+        # 本块自带表头 → 对下一块有效；本块没有 → 用完即失效，不再往下传。
+        inherited = own if (own.tonnage_unit or own.grade_unit) else _UnitHints()
+
         if not _KEYWORD_RE.search(block):
             continue
         snippets.append(_truncate(block))
-        items.extend(_items_from_block(block, hints))
+        items.extend(_items_from_block(block, effective))
     return items, snippets
 
 
@@ -350,4 +562,5 @@ class PdfResourceProvider(PdfProvider):
             fetched_at=fetched_at,
             resources=resources,
             raw_snippets=snippets,
+            self_reported_total_t=parse_self_reported_total(text),
         )

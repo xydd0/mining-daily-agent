@@ -71,6 +71,8 @@ def build_mock_report(pdf_url: str, now: datetime | None = None) -> ResourceRepo
         raw_snippets=[MOCK_NOTICE, *(spec.snippet for spec in _SPECS)],
         # 结构化标记：上层据此判断数据是不是编造的，比在 raw_snippets 里找文案可靠。
         degraded=True,
+        # 内置数据本身就是按类别列的，没有分块重复，合计即逐条之和。
+        self_reported_total_t=sum(spec.tonnage_mt for spec in _SPECS) * 1e6,
     )
 
 
