@@ -5,6 +5,7 @@
 
 [![gate](https://img.shields.io/github/actions/workflow/status/xydd0/mining-daily-agent/ci.yml?job=gate&label=gate&branch=main)](https://github.com/xydd0/mining-daily-agent/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
+[![version](https://img.shields.io/badge/version-v0.1.0-blue)](pyproject.toml)
 
 > ⚠️ **先读数据源策略**：LME 金属现货没有免费行情，价格取的是**代理 ETF 的份额价**
 > （USD/share，不是 USD/t）；新闻与 PDF 源失败会**自动降级为示例数据并在简报中标注**。
@@ -81,6 +82,22 @@ flowchart TB
 > 为何需要 `--directory`：MCP 客户端拉起 server 时的工作目录不一定是本仓库，
 > 而 `uv run` 依赖工作目录来定位项目——少了它，实测会直接
 > `ModuleNotFoundError: No module named 'mining_daily_agent'`。
+
+## Limitations
+
+这是个**能降级、且降级一定留痕**的项目——但降级链路只保证失败被诚实记录，不保证
+拿得到数据。四条边界写在 [docs/architecture.md 的 Known Gaps](docs/architecture.md#known-gaps--已知取舍)：
+
+- **解析器是启发式的**：覆盖 JORC / NI 43-101 的常见表格形态，不保证任意年报都解得出。
+  解析失败或结果可疑时，要么留空并给出原文、要么按 ±5% 容差改用报告自报合计；
+  **绝不用合成数据冒充真实披露值**（合成数据一律带 `degraded` 标记并在简报里标注）。
+  报告含多个项目时，求和会把不同项目的资源量加在一起——±5% 容差挡得住它，但容差
+  分不清「重复计入」与「多项目相加」，风险提示会并列写出两种可能。
+- **Google News 的文章正文取不到**：RSS 里的链接是 Google 中转页，请求返回 200，
+  但正文抽出来是 0 字符。
+- **价格不是 LME 金属价**：LME 现货没有免费行情，取的是代理 ETF / 矿业公司的份额价
+  （USD/share，不是 USD/t）。
+- **LLM 是「有则更好」的依赖**：planner 输出不可解析时回退默认计划，没有 LLM 也能出简报。
 
 ## 开发方式
 
