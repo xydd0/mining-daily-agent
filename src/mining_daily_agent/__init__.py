@@ -1,13 +1,10 @@
-"""mining-daily-agent 包入口。"""
+"""mining-daily-agent：矿业每日简报 agent。
 
-from __future__ import annotations
+命令行入口在 ``mining_daily_agent.__main__``。下面两条命令等价，都走它：
 
-import logging
+    uv run python -m mining_daily_agent "<主题>"
+    uv run mining-daily-agent "<主题>"          # console script
 
-logger = logging.getLogger(__name__)
-
-
-def main() -> None:
-    """命令行入口点。当前为占位实现，待接入采集与编排流程。"""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    logger.info("mining-daily-agent 已启动（当前为占位实现）")
+包根**不再**保留自己的 ``main``：留一个不被引用的入口只会让人走错（原先
+``[project.scripts]`` 指向的就是它）。
+"""

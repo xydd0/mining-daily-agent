@@ -21,7 +21,9 @@ dependencies = [
 ]
 
 [project.scripts]
-mining-daily-agent = "mining_daily_agent:main"
+# 指向真正的 CLI：`uv run mining-daily-agent "<主题>"` 与
+# `uv run python -m mining_daily_agent "<主题>"` 走的是同一个 main。
+mining-daily-agent = "mining_daily_agent.__main__:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

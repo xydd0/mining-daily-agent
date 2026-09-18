@@ -21,8 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `nodes.py`（planner → fetch_data → analyze → synthesize → render）、`graph.py`（`run_daily_brief`）
 - `src/mining_daily_agent/__main__.py` — CLI：`uv run python -m mining_daily_agent "<主题>"`
 - `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
-- `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现（与 `__main__.py` 的 CLI 并存，
-  入口点 `mining-daily-agent` 目前指向它）
+- `src/mining_daily_agent/__init__.py` 只有包说明；命令行入口统一在 `__main__.py`
+  （`python -m mining_daily_agent` 与 console script `mining-daily-agent` 都走它）
 - **没有 CI**；`README.md` 仍为空文件
 
 生成一份简报：
@@ -55,7 +55,8 @@ uv run python scripts/verify_pool.py
 - **包管理只能用 `uv`**（存在 `uv.lock`，build-backend 为 `uv_build`）。不要用 pip / poetry / conda 直接操作环境。
 - **Python 3.12**（`.python-version` 与 `pyproject.toml` 的 `requires-python = ">=3.12"` 一致）。注意系统默认 `python` 是 3.14，务必通过 `uv run` 调用，不要裸跑 `python`。
 - 采用 **src 布局**：代码放 `src/mining_daily_agent/`，`uv_build` 要求保持该结构。子包划分见「代码组织」。
-- 入口点：`mining_daily_agent:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
+- 入口点：`mining_daily_agent.__main__:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
+  **只有这一个** CLI 实现；改动它时 `tests/test_entrypoint.py` 会校验脚本目标没有分叉。
 - `pydantic` 已显式声明进 `dependencies`（此前只靠 `mcp` 传递依赖，属隐患）。
 
 ## 代码组织
@@ -181,7 +182,7 @@ uv run pytest
 
 ```bash
 uv sync                    # 安装/同步依赖
-uv run mining-daily-agent  # 运行入口点（当前仅打印占位字符串）
+uv run mining-daily-agent "<主题>"   # 与 `python -m mining_daily_agent` 等价
 uv add <package>           # 新增运行时依赖
 uv add --dev <package>     # 新增开发依赖
 
@@ -236,5 +237,6 @@ uv run ruff format         # 格式化
 
 1. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
    `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
-2. **两个入口并存**：`pyproject.toml` 的 `mining-daily-agent` 指向 `__init__.py` 的占位
-   `main()`，真正的 CLI 是 `__main__.py`。两者需要合一。
+2. **门禁里的 `mypy src` 不检查 `tests/` 与 `scripts/`**。裸跑 `mypy` 才会按 `files`
+   全量检查——实际已有两个测试文件里的类型错误因此长期未被发现（已修），但只要门禁
+   命令还是 `mypy src`，这类问题就会再次溜过去。
