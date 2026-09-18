@@ -426,14 +426,19 @@ def _sections_from_table(block: str, hints: _UnitHints) -> list[_Section]:
     ]
 
 
-def _pick_section_items(sections: list[_Section]) -> list[ResourceItem]:
-    """从表格分块里挑出应当计入 ``resources`` 的条目。
+def _pick_sections(sections: list[_Section]) -> list[_Section]:
+    """从**全部**表格分块里挑出应当计入的那些。
 
     1. 含 stockpile 的分块**整块剔除**——矿石库存不是矿产资源量；
-    2. 分块自带 ``Sub total`` / ``Total`` 时，只采信**合计最大的那一块**。JORC 表常把
-       同一份资源量按 In-situ / Stockpiles / 全矿三种口径各列一遍（实测 Pilgangoora：
-       In-situ 436 + Stockpiles 9 + 全矿 445），逐块相加得 890，正好是真实值 445 的两倍；
-    3. 一个自报合计都没有时，才把各分块逐行累加。
+    2. 只要有分块带自报合计，就**只取合计最大的那一块**。JORC 表把同一份资源量按
+       In-situ / Stockpiles / 全矿三种口径各列一遍（实测 Pilgangoora 436 + 9 + 445，
+       相加得 890，正好是真值 445 的两倍）；报告里还可能有**多个项目**的资源表
+       （内置年报除 Pilgangoora 445 Mt 外还有 Colina 70.9 Mt），跨块相加得到的是个
+       没有意义的和。取合计最大的那一块，就是报告自己的旗舰口径；
+    3. 一个自报合计都没有时，才全部保留。
+
+    **比较是全局的，不是逐块各自取最大**：分块散在多个文本块里时，逐块取各自的
+    最大值仍会把两个项目加在一起——实测就是这么得到 515.9 Mt 的。
     """
     usable = [section for section in sections if not _is_stockpile(section.label)]
     totalled = [
@@ -442,27 +447,13 @@ def _pick_section_items(sections: list[_Section]) -> list[ResourceItem]:
     if totalled:
         best = max(totalled, key=lambda section: section.self_reported_total_t or 0.0)
         logger.debug(
-            "按自报合计选取分块：label=%s total_t=%.3g 候选=%d（其余分块舍弃，避免重复计入）",
+            "按自报合计选取分块：label=%s total_t=%.3g 候选=%d（其余分块不计入，避免重复计入）",
             best.label,
             best.self_reported_total_t or 0.0,
             len(totalled),
         )
-        return list(best.items)
-    return [item for section in usable for item in section.items]
-
-
-def _items_from_block(block: str, hints: _UnitHints) -> list[ResourceItem]:
-    """在一个文本块内抽取条目。
-
-    表头给出了吨位单位时按**表格**解析（一行 = 一条记录，识别分块与自报合计）；
-    否则按**散文**解析（一个类别词开启一段，段可以跨行）。
-
-    这个分岔是有意的：表格才有「分块小计 / 全矿总计」这层结构，散文没有；
-    把散文套进分块逻辑只会凭空切出些不存在的分块。
-    """
-    if hints.tonnage_unit is not None:
-        return _pick_section_items(_sections_from_table(block, hints))
-    return _items_from_prose(block, hints)
+        return [best]
+    return usable
 
 
 def parse_self_reported_total(text: str) -> float | None:
@@ -493,19 +484,32 @@ def parse_self_reported_total(text: str) -> float | None:
     return max(candidates) if candidates else None
 
 
-def parse_resource_text(text: str) -> tuple[list[ResourceItem], list[str]]:
-    """从 PDF 文本中抽取资源量条目与溯源片段。
+@dataclass(frozen=True, slots=True)
+class ParsedResources:
+    """一次解析的全部产出。"""
+
+    items: list[ResourceItem]
+    snippets: list[str]
+    #: 报告里有、但**没有计入** ``items`` 的资源表（形如 ``"Colina — 70.9 Mt"``）。
+    #: 只在报告含多张资源表、而只采信其中一张时非空；见 :func:`_pick_sections`。
+    excluded_tables: list[str]
+
+
+def parse_resources(text: str) -> ParsedResources:
+    """从 PDF 文本中抽取资源量条目、溯源片段与「未计入的资源表」。
 
     表头单位会**只沿用到紧邻的下一个块**：PDF 文本提取常把表头与数据行切成两块，
     只在块内找表头会漏掉单位。但沿用范围必须限定——早先一路沿用到底，导致真表的
     "Tonnes (Mt)" 表头泄漏进后面几十块会计正文，把那些段落里的任意数字都当成了吨位。
 
-    Returns:
-        ``(条目列表, 命中关键词的原文块列表)``。抽不到条目时第一个列表为空，
-        第二个列表仍会给出候选原文。
+    表格块与散文块分两路抽取，最后**全局**挑块：表格块各自切成若干分块（见
+    :func:`_sections_from_table`），全部汇总后按自报合计挑一张（见
+    :func:`_pick_sections`）。散文块没有分块结构，只在没有任何带自报合计的分块时
+    才予采用——有权威表格时，散落正文里的数字往往是同一份资源量的另一种说法。
     """
-    items: list[ResourceItem] = []
+    prose_items: list[ResourceItem] = []
     snippets: list[str] = []
+    sections: list[_Section] = []
     inherited = _UnitHints()
     for block in _blocks(text):
         # 表头块本身可能不含类别关键词，因此先取提示、再做关键词过滤。
@@ -520,8 +524,50 @@ def parse_resource_text(text: str) -> tuple[list[ResourceItem], list[str]]:
         if not _KEYWORD_RE.search(block):
             continue
         snippets.append(_truncate(block))
-        items.extend(_items_from_block(block, effective))
-    return items, snippets
+        if effective.tonnage_unit is None:
+            # 没有表头单位 → 散文形态：一个类别词开启一段，段可以跨行。
+            prose_items.extend(_items_from_prose(block, effective))
+        else:
+            # 有表头单位 → 表格形态：一行 = 一条记录，识别分块与自报合计。
+            sections.extend(_sections_from_table(block, effective))
+
+    picked = _pick_sections(sections)
+    excluded = [
+        _format_table(section)
+        for section in sections
+        if section.items
+        and not _is_stockpile(section.label)
+        and all(section is not kept for kept in picked)
+    ]
+
+    items = [item for section in picked for item in section.items]
+    if not any(section.self_reported_total_t is not None for section in picked):
+        items.extend(prose_items)
+    return ParsedResources(items=items, snippets=snippets, excluded_tables=excluded)
+
+
+def _format_table(section: _Section) -> str:
+    """把未计入的分块写成一行可读的说明。
+
+    优先用**报告自报**的小计——逐条求和与它可能因四舍五入差一点（实测 In-situ
+    自报 436、逐行加得 437），披露时用报告自己的数字。
+    """
+    total = section.self_reported_total_t
+    if total is None:
+        total = sum(item.tonnage_t for item in section.items)
+    label = section.label or "未命名分块"
+    return f"{label} — {total / 1e6:.1f} Mt"
+
+
+def parse_resource_text(text: str) -> tuple[list[ResourceItem], list[str]]:
+    """从 PDF 文本中抽取资源量条目与溯源片段（:func:`parse_resources` 的简化视图）。
+
+    Returns:
+        ``(条目列表, 命中关键词的原文块列表)``。抽不到条目时第一个列表为空，
+        第二个列表仍会给出候选原文。
+    """
+    parsed = parse_resources(text)
+    return parsed.items, parsed.snippets
 
 
 def _guess_project_name(text: str, url: str) -> str:
@@ -547,20 +593,22 @@ class PdfResourceProvider(PdfProvider):
         fetched_at = datetime.now(UTC)
         payload = _download_pdf(pdf_url)
         text = extract_text(payload)
-        resources, snippets = parse_resource_text(text)
+        parsed = parse_resources(text)
 
         logger.info(
-            "PDF 解析完成：url=%s text_len=%d resources=%d snippets=%d",
+            "PDF 解析完成：url=%s text_len=%d resources=%d snippets=%d excluded_tables=%d",
             pdf_url,
             len(text),
-            len(resources),
-            len(snippets),
+            len(parsed.items),
+            len(parsed.snippets),
+            len(parsed.excluded_tables),
         )
         return ResourceReport(
             project_name=_guess_project_name(text, pdf_url),
             source_url=pdf_url,
             fetched_at=fetched_at,
-            resources=resources,
-            raw_snippets=snippets,
+            resources=parsed.items,
+            raw_snippets=parsed.snippets,
+            excluded_tables=parsed.excluded_tables,
             self_reported_total_t=parse_self_reported_total(text),
         )
