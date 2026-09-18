@@ -23,6 +23,7 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 
 from mining_daily_agent.models.news import Article, NewsItem
+from mining_daily_agent.providers import net
 from mining_daily_agent.providers.news.base import NewsProvider
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,9 @@ ARTICLE_TEXT_MAX_CHARS: Final = 8000
 
 _TAG_RE: Final = re.compile(r"<[^>]+>")
 _WHITESPACE_RE: Final = re.compile(r"\s+")
+#: 关键词之间的连接符。``FetchPlan`` 把关键词数组拼成 ``"A OR B"`` 再交给工具，
+#: 本地过滤时必须按它切回**原始关键词列表**（见 :func:`query_terms`）。
+_QUERY_SEPARATOR_RE: Final = re.compile(r"\s+OR\s+", re.IGNORECASE)
 
 
 class RssFetchError(RuntimeError):
@@ -86,9 +90,15 @@ SOURCES: Final[tuple[RssSource, ...]] = (
 def _http_get(url: str) -> httpx.Response:
     """发出单次 GET。
 
-    这是本模块唯一的 HTTP 接缝：超时在此统一设置，测试也在这里替换。
+    这是本模块唯一的 HTTP 接缝：超时、大小上限与安全护栏都在这里统一设置，
+    测试也在这里替换。正文走 5 MB 上限——HTML 正文不该有 PDF 那么大。
     """
-    return httpx.get(url, timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True)
+    return net.get_capped(
+        url,
+        max_bytes=net.HTML_MAX_BYTES,
+        source_name="新闻页",
+        timeout=HTTP_TIMEOUT_SECONDS,
+    )
 
 
 def _fetch_bytes(url: str) -> bytes:
@@ -197,10 +207,24 @@ def _to_news_item(entry: object, source_name: str) -> NewsItem | None:
     )
 
 
+def query_terms(query: str) -> list[str]:
+    """把检索串还原成**原始关键词列表**：``"Pilbara OR lithium"`` → ``["Pilbara", "lithium"]``。
+
+    实测的坑：早先直接 ``query.split()``，把拼好的 ``"A OR B"`` 按空白切开，**"or" 也成了
+    一个关键词**——于是任何标题里带 "or" 的词（Exploration、Resources、Report…）都被判为
+    命中，备用源的本地过滤形同虚设：抓回来的东西跟查询词毫无关系。
+    """
+    return [term.strip() for term in _QUERY_SEPARATOR_RE.split(query) if term.strip()]
+
+
 def _matches_query(item: NewsItem, query: str) -> bool:
-    """本地关键词过滤：任一分词出现在标题或摘要中即算命中。"""
+    """本地关键词过滤：任一**关键词**出现在标题或摘要中即算命中。
+
+    匹配的是原始关键词（可以是词组），不是拆散的单字——拆开会让 "mine"、"or" 这类词
+    把无关条目放进来。
+    """
     haystack = f"{item.title} {item.summary}".casefold()
-    return any(token in haystack for token in query.casefold().split())
+    return any(term.casefold() in haystack for term in query_terms(query))
 
 
 def _meta_published(soup: BeautifulSoup) -> datetime | None:
