@@ -79,3 +79,12 @@ class ResourceReport(BaseModel):
             "parsed report. NEVER present degraded figures as real: say so explicitly."
         ),
     )
+    self_reported_total_t: float | None = Field(
+        default=None,
+        description=(
+            "Total tonnage the report states for itself (its 'Total' row), in tonnes. "
+            "Use it to cross-check a sum over `resources` — JORC tables list both "
+            "sub-block subtotals and the project total, so adding every row double "
+            "counts. Null when the report has no recognisable total row."
+        ),
+    )

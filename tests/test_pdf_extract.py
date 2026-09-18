@@ -123,6 +123,81 @@ def _stub_get(
     return _get
 
 
+# --- 真实年报回归：量级必须合理 ---------------------------------------------
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+PLS_TABLE = FIXTURE_DIR / "pls_2025_mineral_resource_table.txt"
+
+
+def test_case_insensitive_prose_is_not_mistaken_for_a_resource_table() -> None:
+    """类别只认首字母大写——这是最大的一类误报来源。
+
+    实测 Pilbara Minerals 2025 年报：87 条抽取里 80 条来自 "measured at fair value"、
+    "where indicated in the Annual Report"、"measured against the Baseline" 这类句子，
+    而资源表里的类别词**全部**是首字母大写。
+    """
+    text = (
+        "Indicated 214 Mt at 1.15% Li2O\n"
+        "Items are measured at fair value. Amounts are indicated in note 12.\n"
+        "Performance is measured against the Baseline over a 3-year period.\n"
+    )
+
+    items, _ = pdf_parser.parse_resource_text(text)
+
+    assert len(items) == 1, "小写的 measured / indicated 不应产生条目"
+    assert items[0].category is ResourceCategory.INDICATED
+
+
+def test_self_reported_total_is_read_from_the_table() -> None:
+    """表里既有分块 Sub total（436 / 9）也有全矿 Total（445），应取最大者。
+
+    这个值是交叉核对的基准：按类别逐行相加会把分块与总计算两遍。
+    """
+    total = pdf_parser.parse_self_reported_total(PLS_TABLE.read_text(encoding="utf-8"))
+
+    assert total is not None
+    assert total == pytest.approx(445e6), "应取全矿总计而非分块小计"
+
+    items, _ = pdf_parser.parse_resource_text(PLS_TABLE.read_text(encoding="utf-8"))
+    assert sum(item.tonnage_t for item in items) > total, (
+        "逐条求和本就会超过自报合计——这正是需要交叉核对的原因"
+    )
+
+
+def test_self_reported_total_is_none_without_a_total_row() -> None:
+    assert pdf_parser.parse_self_reported_total("Indicated 214 Mt at 1.15% Li2O") is None
+
+
+def test_real_annual_report_table_parses_to_a_sane_magnitude() -> None:
+    """用真实年报的资源表页做回归。
+
+    fixture 是 Pilbara Minerals 2025 年报第 32 页 Table 5 的文本（从 "Table 5:" 到
+    "Table 6:" 之间）。未修复前同一份文档能抽出 87 条、Measured 合计十亿吨级——
+    全是会计正文误报；修复后应只剩表里的真实行，量级回到 1e8 吨量级。
+
+    已知不足（**未被本测试覆盖，别当成已修**）：品位多不可靠（表把单位放在列头，
+    段内第一个带 % 的数字常来自 "(≥0.2% Li2O)" 这类注脚）；Stockpiles 的 Inferred
+    行没有数值，会误取到同块的 "Sub total" 数字。
+    """
+    items, snippets = pdf_parser.parse_resource_text(PLS_TABLE.read_text(encoding="utf-8"))
+
+    # 1. 没有失控的误报：真实表只有 9 行（3 个分块 × 3 个类别）。
+    assert len(items) <= 12, f"条目数失控：{len(items)}"
+    assert snippets, "命中关键词的原文应留作溯源"
+
+    # 2. 每一条的吨位都在可信量级内。
+    for item in items:
+        assert pdf_parser.TONNAGE_MIN_T <= item.tonnage_t <= pdf_parser.TONNAGE_MAX_T
+
+    # 3. 表里的关键行都在：Pilgangoora 分块的三个类别。
+    by_tonnage = {round(item.tonnage_t / 1e6, 1) for item in items}
+    assert {19.0, 356.0, 70.0} <= by_tonnage, f"缺少合并行，实得 {sorted(by_tonnage)}"
+
+    # 4. 合计回到合理量级——修复前是 1,068,508 Mt。
+    total_mt = sum(item.tonnage_t for item in items) / 1e6
+    assert total_mt < 1500, f"合计 {total_mt:.1f} Mt 明显偏高，疑似误报回归"
+
+
 # --- 场景 1：正常解析出 Indicated / Inferred --------------------------------
 
 

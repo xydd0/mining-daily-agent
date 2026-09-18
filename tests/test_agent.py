@@ -633,6 +633,63 @@ async def test_analyze_summarises_price_and_tonnage() -> None:
     assert any("Inferred 合计 89.0 Mt" in item for item in highlights)
 
 
+async def test_analyze_replaces_a_double_counted_sum_with_the_self_reported_total() -> None:
+    """JORC 表同时列分块小计与全矿总计，逐行相加会把同一份资源量算两遍。
+
+    实测一份真实年报把 356 Mt 的 Indicated 加成 760 Mt。报告自报合计更小时以自报为准，
+    并且必须留下提示——否则简报会把重复计算的数字当事实呈现。
+    """
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport(
+        project_name="Pilgangoora",
+        source_url=REPORT_URL,
+        fetched_at=datetime(2026, 9, 18, tzinfo=UTC),
+        resources=[
+            ResourceItem(
+                category=ResourceCategory.INDICATED,
+                commodity="Li2O",
+                tonnage_t=349e6,
+                grade=1.29,
+                grade_unit="%",
+            ),
+            ResourceItem(
+                category=ResourceCategory.INDICATED,
+                commodity="Li2O",
+                tonnage_t=356e6,
+                grade=1.29,
+                grade_unit="%",
+            ),
+        ],
+        # 逐条求和 705 Mt，自报合计 445 Mt → 明显重复
+        self_reported_total_t=445e6,
+    )
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("445.0 Mt" in item for item in highlights), "应以自报合计为准"
+    assert not any("705" in item for item in highlights), "不应再把重复求和高亮出去"
+    notes = result["risk_notes"]
+    assert isinstance(notes, list)
+    assert any("重复计入" in note for note in notes)
+
+
+async def test_analyze_keeps_per_category_totals_when_they_agree() -> None:
+    """自报合计与求和一致时不该误报重复——正常报告仍要给出分类别数字。"""
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 389e6  # 与逐条求和（214+86+89）一致
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload)
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("Indicated 合计 300.0 Mt" in item for item in highlights)
+    assert result["risk_notes"] == []
+
+
 async def test_analyze_flags_risk_keywords_in_headlines() -> None:
     state = initial_state(TOPIC)
     state["news"] = [

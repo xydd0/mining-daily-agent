@@ -415,18 +415,41 @@ def _price_highlight(trend: TrendSeries) -> str:
     return "；".join(parts) + f"（{len(trend.points)} 个交易日）"
 
 
-def _resource_highlights(report: ResourceReport) -> list[str]:
-    """按类别汇总吨位。"""
+#: 逐条求和超过报告自报合计多少倍即判定为「重复计入」。
+DOUBLE_COUNT_RATIO: Final = 1.2
+
+
+def _resource_highlights(report: ResourceReport) -> tuple[list[str], list[str]]:
+    """按类别汇总吨位，并与报告自报合计做交叉核对。
+
+    JORC 资源表同时列出**各分块小计**与**全矿总计**（Pilgangoora 的 In-situ 349 +
+    Stockpiles 8 + 总计 356 是同一份资源量的三种口径）。既然解析器按类别逐行抽，
+    直接相加就会把同一份资源量算两遍——实测一份真实年报把 356 Mt 的 Indicated
+    加成 760 Mt。报告自报合计比求和还小时，以自报为准。
+
+    Returns:
+        ``(高亮行, 风险提示行)``。
+    """
     totals: dict[ResourceCategory, float] = {}
     for item in report.resources:
         totals[item.category] = totals.get(item.category, 0.0) + item.tonnage_t
+
+    overall = sum(totals.values())
+    self_reported = report.self_reported_total_t
+    if self_reported is not None and overall > self_reported * DOUBLE_COUNT_RATIO:
+        note = (
+            f"资源量按类别逐行求和得 {overall / 1e6:.1f} Mt，超过报告自报合计 "
+            f"{self_reported / 1e6:.1f} Mt——同一份资源量在分块小计与总计里被重复计入，"
+            "已以报告自报合计为准。"
+        )
+        return [f"{report.project_name} 自报资源量合计 {self_reported / 1e6:.1f} Mt"], [note]
 
     highlights: list[str] = []
     for category in (ResourceCategory.INDICATED, ResourceCategory.INFERRED):
         tonnes = totals.get(category)
         if tonnes:
             highlights.append(f"{report.project_name} {category.value} 合计 {tonnes / 1e6:.1f} Mt")
-    return highlights
+    return highlights, []
 
 
 async def analyze(state: BriefState) -> dict[str, object]:
@@ -440,7 +463,9 @@ async def analyze(state: BriefState) -> dict[str, object]:
 
     report = state["resource_report"]
     if report is not None:
-        highlights.extend(_resource_highlights(report))
+        resource_highlights, resource_notes = _resource_highlights(report)
+        highlights.extend(resource_highlights)
+        notes.extend(resource_notes)
 
     for item in state["news"]:
         lowered = f"{item.title} {item.summary}".casefold()
