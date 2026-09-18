@@ -203,6 +203,13 @@ SECTION_RESOURCE: Final = "## 二、储量数据"
 SECTION_PRICE: Final = "## 三、价格走势"
 SECTION_RISK: Final = "## 四、风险提示"
 SECTION_CITATIONS: Final = "## 引用源"
+#: 正文没抓到时，新闻小节末尾的统一注释。
+#:
+#: 各条导语逐条写「该报道正文未能抓取」既啰嗦又抢戏，收成一句放在小节末尾说明一次。
+#: 风险提示里对应的那条保留——那是披露，与小节注释不是一回事。
+NEWS_BODY_NOTE: Final = (
+    "注：本期新闻源经 Google News 中转页，正文未能抓取，各条导语基于标题与摘要撰写。"
+)
 
 #: LLM 在整条流水线里**只负责**新闻小节的小标题与导语——这两样确实需要理解正文。
 #: 其余小节全部由代码按模板渲染：小节名、编号对应、「矿石量」这类措辞是硬性约束，
@@ -213,10 +220,14 @@ _NEWS_PROMPT: Final = """你是矿业分析师。下面每条新闻都有自己�
 {{"items": [{{"index": 1, "headline": "…", "lede": "…"}}]}}
 
 硬性要求：
+- **小标题必须是你自拟的完整概括短句**，≤ {headline_max} 字，把该条讲了什么概括出来
+  （如「锂价走势牵动 ASX 电池材料股」）。**不要照抄或截取原标题**，句末**不要**用省略号
+  ——「Pilbara Minerals 定于11月24…」这种剪断的半句话是明确禁止的
+- 小标题不带编号
 - 导语**只能**用该条自己那份资料，不得掺入任何其它条目的内容——把 A 条的正文配到
   B 条标题下是严重错误
 - 时间、主体、数字都必须与该条资料一致；资料里没有的一律不写，不要推测
-- 小标题 ≤ {headline_max} 字，不带编号
+- **不要在导语里交代正文有没有抓到**：那由小节末尾的统一注释说明一次，逐条重复会抢戏
 - 标有「{degraded_mark}」的资料不是真实报道，导语里必须写明这一点
 
 ## 新闻资料
@@ -696,12 +707,26 @@ def _citation_numbers(state: BriefState) -> dict[str, int]:
     return numbers
 
 
-def _headline(text: str) -> str:
-    """压成 ≤ ``NEWS_HEADLINE_MAX_CHARS`` 字的小标题。"""
+def _clean_headline(text: str, item: NewsItem) -> str | None:
+    """规整 LLM 给的小标题；有剪裁痕迹时返回 ``None``，由调用方兜底。
+
+    **这里不截断**。早先超过 ``NEWS_HEADLINE_MAX_CHARS`` 就砍到 24 字加省略号，结果
+    输出「Pilbara Minerals 定于11月24…」这样的半句话——那不是概括，是把一句话剪断了。
+    字数由提示词约束（要求自拟 ≤25 字的完整短句），代码只负责拒掉明显不完整的写法：
+
+    - 句末省略号：剪裁留下的痕迹；
+    - 原标题的子串：照抄或截取原标题，不是自拟。
+
+    两种都退回「原标题当小标题」的兜底——宁可用一条完整（哪怕偏长）的原始标题，
+    也不要半句话。
+    """
     collapsed = _WHITESPACE_RE.sub(" ", text).strip()
-    if len(collapsed) <= NEWS_HEADLINE_MAX_CHARS:
-        return collapsed
-    return collapsed[: NEWS_HEADLINE_MAX_CHARS - 1].rstrip() + "…"
+    if not collapsed or collapsed.endswith(("…", "...")):
+        return None
+    title = _WHITESPACE_RE.sub(" ", item.title).strip().casefold()
+    if collapsed.casefold() in title:
+        return None
+    return collapsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,14 +754,16 @@ def _news_prompt_data(state: BriefState) -> str:
         ]
         if article is not None and article.url == item.url:
             body = _WHITESPACE_RE.sub(" ", article.text).strip()
-            lines.append(f"    正文：{body or '（抓到的正文为空）'}")
+            lines.append(f"    正文：{body or '（无）'}")
         else:
-            lines.append("    正文：（未抓取，只能用标题与摘要）")
+            # 刻意不写「只能用标题与摘要」这类提示：LLM 会把它原样抄进导语，而
+            # 「正文没抓到」这件事由小节末尾的统一注释讲一次就够了（见 NEWS_BODY_NOTE）。
+            lines.append("    正文：（无）")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
-def _parse_ledes(text: str) -> dict[int, NewsLede]:
+def _parse_ledes(text: str, news: list[NewsItem]) -> dict[int, NewsLede]:
     """解析 LLM 给出的 ``{"items": [...]}``；形状不对的条目直接丢弃（走兜底写法）。"""
     payload = _extract_json_object(text)
     if payload is None:
@@ -754,19 +781,26 @@ def _parse_ledes(text: str) -> dict[int, NewsLede]:
         lede = entry.get("lede")
         if not isinstance(index, int) or not isinstance(headline, str) or not isinstance(lede, str):
             continue
-        if not headline.strip() or not lede.strip():
+        if not lede.strip() or not 1 <= index <= len(news):
             continue
-        ledes[index] = NewsLede(headline=_headline(headline), lede=lede.strip())
+        cleaned = _clean_headline(headline, news[index - 1])
+        if cleaned is None:
+            continue
+        ledes[index] = NewsLede(headline=cleaned, lede=lede.strip())
     return ledes
 
 
 def _fallback_lede(item: NewsItem) -> NewsLede:
-    """LLM 没给出这一条时的确定性写法：标题当小标题，摘要当导语。"""
+    """LLM 没给出这一条时的确定性写法：原标题当小标题，摘要当导语。
+
+    小标题这里**不裁剪、不加省略号**——裁剪出来的半句话正是本轮要消掉的东西。
+    """
+    headline = _WHITESPACE_RE.sub(" ", item.title).strip()
     summary = _WHITESPACE_RE.sub(" ", item.summary).strip()
-    lede = summary or f"{item.source} 于 {item.published_at.date().isoformat()} 报道：{item.title}"
+    lede = summary or f"{item.source} 于 {item.published_at.date().isoformat()} 报道：{headline}"
     if item.degraded:
         lede = f"{DEGRADED_MARK}{lede}"
-    return NewsLede(headline=_headline(item.title), lede=lede)
+    return NewsLede(headline=headline or item.url, lede=lede)
 
 
 async def _news_ledes(state: BriefState) -> dict[int, NewsLede]:
@@ -781,7 +815,7 @@ async def _news_ledes(state: BriefState) -> dict[int, NewsLede]:
     except Exception as exc:  # 简报必须出得来，LLM 挂了不是中断流程的理由
         logger.warning("新闻导语生成失败，改用标题与摘要：%s: %s", type(exc).__name__, exc)
         return {}
-    return _parse_ledes(_message_text(response))
+    return _parse_ledes(_message_text(response), state["news"])
 
 
 # --- 模板渲染 ---------------------------------------------------------------
@@ -795,6 +829,12 @@ def _render_title(state: BriefState) -> str:
     )
 
 
+def _body_unavailable(state: BriefState) -> bool:
+    """我们尝试抓的那条正文是不是没拿到（压根没抓 / 抓回来是空的）。"""
+    article = state["article"]
+    return article is None or not article.text.strip()
+
+
 def _render_news(state: BriefState, ledes: dict[int, NewsLede]) -> str:
     if not state["news"]:
         return (
@@ -804,6 +844,8 @@ def _render_news(state: BriefState, ledes: dict[int, NewsLede]) -> str:
     for index, item in enumerate(state["news"], 1):
         lede = ledes.get(index) or _fallback_lede(item)
         blocks.append(f"**{index}. {lede.headline}**\n{lede.lede} [{index}]")
+    if _body_unavailable(state):
+        blocks.append(NEWS_BODY_NOTE)
     return "\n\n".join(blocks)
 
 

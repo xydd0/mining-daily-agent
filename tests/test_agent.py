@@ -35,7 +35,7 @@ from mining_daily_agent.agent.nodes import (
     ARTICLE_EXCERPT_CHARS,
     DEGRADED_MARK,
     MIN_PLAN_DAYS,
-    NEWS_HEADLINE_MAX_CHARS,
+    NEWS_BODY_NOTE,
     ToolCaller,
     analyze,
     build_citations,
@@ -930,23 +930,64 @@ async def test_irrelevant_news_is_filtered_out(monkeypatch: pytest.MonkeyPatch) 
     assert "与主题主体" in document, "剔除动作要在风险提示里留痕"
 
 
-async def test_headline_is_capped_at_the_spec_length(monkeypatch: pytest.MonkeyPatch) -> None:
-    """要点式小标题 ≤25 字——LLM 写超了由代码压，不指望它自己数。"""
+async def test_headlines_are_never_truncated_with_an_ellipsis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """小标题必须是完整短句，不能是「…」结尾的半句话。
+
+    实测出现过「Pilbara Minerals 定于11月24…」——那是代码按 25 字硬砍出来的。现在
+    代码**不再截断**：字数由提示词约束，代码只拒掉带剪裁痕迹的写法，并退回原标题兜底。
+    """
     _install_llm(
         monkeypatch,
         PLAN_REPLY,
         json.dumps(
-            {"items": [{"index": 1, "headline": "很" * 60, "lede": "导语。"}]},
+            {
+                "items": [
+                    {"index": 1, "headline": "锂价走势牵动 ASX 电池材料股", "lede": "导语一。"},
+                    {"index": 2, "headline": "Pilbara Minerals 定于11月24…", "lede": "导语二。"},
+                ]
+            },
             ensure_ascii=False,
         ),
     )
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
 
-    line = next(text for text in document.splitlines() if text.startswith("**1. "))
-    headline = line.removeprefix("**1. ").removesuffix("**")
-    assert len(headline) == NEWS_HEADLINE_MAX_CHARS == 25
-    assert headline.endswith("…")
+    headlines = [line for line in document.splitlines() if line.startswith("**")]
+    assert len(headlines) == 2
+    for line in headlines:
+        assert "…" not in line, f"小标题带了剪裁痕迹：{line}"
+        assert "..." not in line, f"小标题带了剪裁痕迹：{line}"
+    assert "锂价走势牵动 ASX 电池材料股" in document, "自拟的完整短句原样采用"
+    assert "Pilbara lithium output rises 1" in document, "被拒的那条退回原标题兜底"
+
+
+async def test_news_body_note_is_printed_once_at_the_section_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """「正文未抓取」只在新闻小节末尾说一次，不在各条导语里逐条重复。"""
+    responses = _responses()
+    responses[("news", "fetch_article")] = _ok(_article_payload(text=""))  # 抓回空正文
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    assert document.count(NEWS_BODY_NOTE) == 1, "统一注释只出现一次"
+    news_section = document.split("## 二、储量数据")[0]
+    assert NEWS_BODY_NOTE in news_section, "注释应落在新闻摘要小节里"
+    assert "抓回的正文为空" in document, "风险提示中对应条目保留，不改"
+
+
+async def test_no_body_note_when_the_article_was_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正文抓到了就不该出现这句注释——它描述的是没抓到的情况。"""
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert NEWS_BODY_NOTE not in document
 
 
 async def test_news_falls_back_to_title_and_summary_when_the_llm_gives_nothing(
