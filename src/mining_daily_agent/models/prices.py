@@ -41,6 +41,14 @@ class PricePoint(BaseModel):
             "the instrument; synthesized fallback data is labelled as such."
         )
     )
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when this figure is synthesized fallback data rather than a real "
+            "quote. NEVER present degraded prices as a real market print: say so "
+            "explicitly in any summary that quotes them."
+        ),
+    )
 
 
 class TrendSeries(BaseModel):
@@ -68,6 +76,13 @@ class TrendSeries(BaseModel):
         description="Simple moving average of the last 30 points; null when fewer than 30.",
     )
     source: str = Field(description="Source label shared by every point in `points`.")
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when this series is synthesized fallback data rather than real "
+            "quotes. NEVER present a degraded trend as real market history."
+        ),
+    )
 
     @model_validator(mode="after")
     def _points_are_consistent(self) -> Self:
@@ -78,4 +93,7 @@ class TrendSeries(BaseModel):
         if self.min > self.max:
             msg = f"min ({self.min}) 不应大于 max ({self.max})。"
             raise ValueError(msg)
+        if any(point.degraded for point in self.points):
+            # 任一点是合成的，整条序列就是合成的——别让标记在聚合这一步丢掉。
+            object.__setattr__(self, "degraded", True)
         return self

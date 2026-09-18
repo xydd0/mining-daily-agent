@@ -57,7 +57,7 @@ CHALLENGE_HTML = (
     "</body></html>"
 )
 
-_Stub = Callable[[str, Mapping[str, str] | None], httpx.Response]
+_Stub = Callable[[str, Mapping[str, str] | None, Mapping[str, str] | None], httpx.Response]
 
 
 def _response(
@@ -75,10 +75,21 @@ def _stub(
     *,
     stooq_text: str | None = None,
     yahoo_payload: object | None = None,
+    seen_params: list[Mapping[str, str]] | None = None,
 ) -> _Stub:
-    """构造一个假的 _http_get：按域名返回不同内容，未提供的源一律失败。"""
+    """构造一个假的 _http_get：按域名返回不同内容，未提供的源一律失败。
 
-    def _get(url: str, headers: Mapping[str, str] | None = None) -> httpx.Response:
+    ``seen_params`` 传一个列表进来，即可记录每次请求带的查询参数——``range`` /
+    ``interval`` 这类参数在返回内容里看不出来，只能这样断言。
+    """
+
+    def _get(
+        url: str,
+        headers: Mapping[str, str] | None = None,
+        params: Mapping[str, str] | None = None,
+    ) -> httpx.Response:
+        if seen_params is not None:
+            seen_params.append(dict(params or {}))
         if "stooq.com" in url:
             if stooq_text is None:
                 return _response(url, "forbidden", "text/plain", status=403)
@@ -338,6 +349,26 @@ def test_yahoo_is_tried_before_stooq(monkeypatch: pytest.MonkeyPatch) -> None:
     assert point.price == pytest.approx(72.0)
 
 
+def test_yahoo_request_asks_for_daily_bars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """必须显式要 ``range`` 与 ``interval=1d``。
+
+    不带这两个参数时 Yahoo 返回的是**当日盘中**的密集采样：同一交易日几十条、时间戳
+    几乎相同，走势图把一天画成锯齿，``change_pct`` 也从「区间首末」变成「开盘到此刻」。
+    """
+    seen: list[Mapping[str, str]] = []
+    monkeypatch.setattr(
+        price_stooq,
+        "_http_get",
+        _stub(yahoo_payload=_primary_yahoo(), seen_params=seen),
+    )
+
+    StooqPriceProvider().get_trend("lithium", 30)
+
+    assert seen, "应当发出过请求"
+    assert seen[0]["range"] == price_stooq.YAHOO_RANGE == "6mo"
+    assert seen[0]["interval"] == price_stooq.YAHOO_DAY_INTERVAL == "1d"
+
+
 def test_source_priority_is_yahoo_then_stooq() -> None:
     assert [source.name for source in price_stooq.SOURCES] == ["Yahoo Finance", "Stooq"]
 
@@ -451,6 +482,29 @@ def test_unsupported_commodity_is_not_degraded(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(ToolError, match="不支持的品种"):
         price_server.get_price(commodity="gold")
+
+
+def test_fallback_to_mock_marks_the_result_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """源故障降级成合成序列时，degraded 必须一路传到工具返回值上。
+
+    没有这个标记，简报会把随机游走当成真实行情——`source` 那句免责声明是给人看的，
+    机器读不出来。
+    """
+    monkeypatch.setattr(price_stooq, "_http_get", _stub())
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    series = price_server.get_trend("lithium", 10)
+
+    assert series.degraded
+    assert all(point.degraded for point in series.points), "每个点也要带标记"
+
+
+def test_real_series_from_the_tool_is_not_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
+
+    series = price_server.get_trend("lithium", 10)
+
+    assert not series.degraded
 
 
 def test_tool_propagates_source_failure_that_the_mock_also_cannot_serve(
@@ -605,6 +659,49 @@ def test_mock_series_is_labelled_as_synthetic() -> None:
 
     assert all(point.source == MOCK_SOURCE for point in points)
     assert all(point.unit == "USD/t" for point in points)
+
+
+def test_mock_points_are_marked_degraded() -> None:
+    """合成的价格点必须带结构化标记。
+
+    ``source`` 是一句给人看的免责声明，机器读不出来；上游要靠 ``degraded`` 字段
+    决定要不要在简报里加标注（与新闻、PDF 的 mock 同一套约定）。
+    """
+    points = build_mock_series("lithium")
+
+    assert points
+    assert all(point.degraded for point in points)
+
+
+def test_trend_series_inherits_degraded_from_its_points() -> None:
+    """任一点是合成的，整条序列就是合成的——别让标记在聚合这一步丢掉。"""
+    point = PricePoint(
+        commodity="lithium",
+        date=date(2026, 9, 18),
+        price=70.0,
+        unit="USD/share",
+        source="test",
+        degraded=True,
+    )
+
+    series = build_trend_series("lithium", [point], "test")
+
+    assert series.degraded
+
+
+def test_real_series_is_not_marked_degraded() -> None:
+    """真实行情不能被误标成合成数据——那会让整节价格失去可信度。"""
+    point = PricePoint(
+        commodity="lithium",
+        date=date(2026, 9, 18),
+        price=70.0,
+        unit="USD/share",
+        source="test",
+    )
+
+    series = build_trend_series("lithium", [point], "test")
+
+    assert not series.degraded
 
 
 def test_mock_provider_returns_price_for_a_known_date() -> None:
