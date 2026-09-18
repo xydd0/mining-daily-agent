@@ -113,7 +113,10 @@ uv run ruff check .
 uv run mypy src
 uv run pytest --cov=mining_daily_agent --cov-fail-under=70
 
-uv run pytest tests/test_x.py::test_name -v   # 跑单个测试（tests/ 尚未创建）
+# 跑单个测试/单个文件：必须带 --no-cov，否则全局覆盖率门槛必然不达标而报错
+uv run pytest tests/test_pdf_extract.py -v --no-cov
+uv run pytest tests/test_pdf_extract.py::test_name -v --no-cov
+
 uv run ruff format         # 格式化
 ```
 
