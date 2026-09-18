@@ -88,8 +88,8 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.12"
-# 注意：门禁里的 `mypy src` 会覆盖这里的 files，只检查 src；
-# 裸跑 `mypy` 才按此列表检查全部三个目录。
+# 门禁命令就是裸 `mypy`（配合 pre-commit 钩子与 CI），因此这个列表就是检查范围。
+# 不要把命令写回 `mypy src`：那会覆盖此列表，让 tests/ 与 scripts/ 的类型错误溜过去。
 files = ["src", "tests", "scripts"]
 strict = true
 disallow_any_explicit = true

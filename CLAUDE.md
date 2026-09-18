@@ -23,7 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
 - `src/mining_daily_agent/__init__.py` 只有包说明；命令行入口统一在 `__main__.py`
   （`python -m mining_daily_agent` 与 console script `mining-daily-agent` 都走它）
-- **没有 CI**；`README.md` 仍为空文件
+- **CI 已接入**（`.github/workflows/ci.yml`，跑同一套四项门禁）；`README.md` 仍为空文件
 
 生成一份简报：
 
@@ -172,11 +172,16 @@ src/mining_daily_agent/
 ```bash
 uv run ruff check .
 uv run ruff format --check
-uv run mypy src
+uv run mypy
 uv run pytest
 ```
 
-`ruff format --check` 是后补的一项。原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。pre-commit 的 `ruff format` 钩子会自动改文件，但**用 `git commit` 绕过 pre-commit 时就没有这道网**，此时 `--check` 是唯一拦截点。
+同一套命令也写在 `.pre-commit-config.yaml` 与 `.github/workflows/ci.yml` 里，三处需保持一致。
+
+两处命令都改过，原因都是「看起来过了，其实没查」：
+
+- `ruff format --check` 是后补的。原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。
+- `mypy` 由 `mypy src` 放宽而来。带 `src` 参数会**覆盖 `pyproject.toml` 的 `files` 列表**，只检查 src；`tests/` 与 `scripts/` 的类型错误因此长期无人发现（实跑裸 `mypy` 才暴露两处）。
 
 ## 常用命令
 
@@ -186,9 +191,10 @@ uv run mining-daily-agent "<主题>"   # 与 `python -m mining_daily_agent` 等�
 uv add <package>           # 新增运行时依赖
 uv add --dev <package>     # 新增开发依赖
 
-# 提交前三件套，必须全绿（见「提交规范」）
+# 提交前四项门禁，必须全绿（见「提交规范」）
 uv run ruff check .
-uv run mypy src
+uv run ruff format --check
+uv run mypy
 uv run pytest --cov=mining_daily_agent --cov-fail-under=70
 
 # 跑单个测试/单个文件：必须带 --no-cov，否则全局覆盖率门槛必然不达标而报错
@@ -237,6 +243,5 @@ uv run ruff format         # 格式化
 
 1. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
    `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
-2. **门禁里的 `mypy src` 不检查 `tests/` 与 `scripts/`**。裸跑 `mypy` 才会按 `files`
-   全量检查——实际已有两个测试文件里的类型错误因此长期未被发现（已修），但只要门禁
-   命令还是 `mypy src`，这类问题就会再次溜过去。
+2. **门禁三处（CLAUDE.md / pre-commit / CI）需要手工保持一致**。改了一处忘了另一处，
+   「本地过了但 CI 挂了」就会重演。三者都是明文命令，没有单一事实来源。

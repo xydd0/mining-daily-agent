@@ -20,7 +20,9 @@ repos:
 
       - id: mypy
         name: mypy
-        entry: uv run mypy src
+        # 全量检查 src + tests + scripts（`files` 列表见 pyproject.toml），
+        # 与门禁命令保持一致——只查 src 会漏掉测试里的类型错误。
+        entry: uv run mypy
         language: system
         types_or: [python, pyi]
         pass_filenames: false
