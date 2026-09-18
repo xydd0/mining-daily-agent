@@ -21,7 +21,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
-from mining_daily_agent.providers import BROWSER_USER_AGENT
+from mining_daily_agent.providers import BROWSER_USER_AGENT, net
 from mining_daily_agent.providers import pdf as pdf_pkg
 from mining_daily_agent.providers.pdf import mock as pdf_mock
 from mining_daily_agent.providers.pdf import parser as pdf_parser
@@ -656,6 +656,21 @@ def test_invalid_url_raises(bad_url: str) -> None:
         pdf_server.extract_resources(pdf_url=bad_url)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1/report.pdf",
+        "http://10.0.0.5/report.pdf",
+        "http://localhost/report.pdf",
+    ],
+)
+def test_private_pdf_urls_are_rejected(url: str) -> None:
+    """PDF 地址来自检索结果，是不可信输入；探测内网必须**被拒**而不是降级成 mock。"""
+    with pytest.raises(ToolError, match="拒绝访问"):
+        pdf_server.extract_resources(pdf_url=url)
+
+
 def test_invalid_url_error_is_a_tool_error_so_message_reaches_the_llm() -> None:
     """MCP 只原样转发 ToolError 的 message；其余异常会被替换成通用文案。"""
     with pytest.raises(ToolError) as excinfo:
@@ -667,18 +682,20 @@ def test_invalid_url_error_is_a_tool_error_so_message_reaches_the_llm() -> None:
 # --- 下载层：超时、重试、Content-Type 校验 ----------------------------------
 
 
-def test_http_get_sets_explicit_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_http_get_sets_explicit_timeout_and_size_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """超时与大小上限都必须显式给，不能靠库的默认行为。"""
     seen: dict[str, object] = {}
 
     def _fake(url: str, **kwargs: object) -> httpx.Response:
         seen.update(kwargs)
         return _pdf_response(url, FAKE_PDF_PAYLOAD)
 
-    monkeypatch.setattr(httpx, "get", _fake)
+    monkeypatch.setattr(net, "get_capped", _fake)
 
     pdf_parser._http_get(REPORT_URL)
 
     assert seen["timeout"] == pdf_parser.PDF_TIMEOUT_SECONDS == 30.0
+    assert seen["max_bytes"] == net.PDF_MAX_BYTES
 
 
 def test_http_get_sends_a_browser_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -689,7 +706,7 @@ def test_http_get_sends_a_browser_user_agent(monkeypatch: pytest.MonkeyPatch) ->
         seen.update(kwargs)
         return _pdf_response(url, FAKE_PDF_PAYLOAD)
 
-    monkeypatch.setattr(httpx, "get", _fake)
+    monkeypatch.setattr(net, "get_capped", _fake)
 
     pdf_parser._http_get(REPORT_URL)
 

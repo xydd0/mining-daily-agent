@@ -22,7 +22,7 @@ import httpx
 import pdfplumber
 
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
-from mining_daily_agent.providers import BROWSER_USER_AGENT
+from mining_daily_agent.providers import BROWSER_USER_AGENT, net
 from mining_daily_agent.providers.pdf.base import PdfProvider
 
 logger = logging.getLogger(__name__)
@@ -126,15 +126,19 @@ class PdfFetchError(RuntimeError):
 def _http_get(url: str) -> httpx.Response:
     """发出单次 GET。
 
-    这是本模块唯一的 HTTP 接缝：超时与请求头在此统一设置，测试也在这里替换。
+    这是本模块唯一的 HTTP 接缝：超时、请求头、大小上限与安全护栏都在这里统一设置，
+    测试也在这里替换。
 
     带浏览器 UA 作为兼容手段：**并非所有站点都需要**（pls.com 的年报、Yahoo 的行情接口
     不带也能取到），但部分站点会对非浏览器 UA 直接 403（实测 mining.com 的文章页）。
+
+    PDF 给到 50 MB 上限：内置年报就有 15.6 MB，但也不该任由一个链接把内存吃光。
     """
-    return httpx.get(
+    return net.get_capped(
         url,
+        max_bytes=net.PDF_MAX_BYTES,
+        source_name="PDF 报告",
         timeout=PDF_TIMEOUT_SECONDS,
-        follow_redirects=True,
         headers={"User-Agent": BROWSER_USER_AGENT, "Accept": "application/pdf,*/*"},
     )
 
