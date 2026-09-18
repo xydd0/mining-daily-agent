@@ -26,7 +26,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **CI 已接入**（`.github/workflows/ci.yml`，两个并行 job：`gate` 跑同一套四项门禁、
   `docker-build` 验证镜像可构建并启用 GHA 层缓存）
 - **已容器化**：`Dockerfile`（多阶段）+ `docker-compose.yml`，见「容器化」
-- `README.md` 仍为空文件
+- 交付文档：`README.md`（简介 / 架构图 / 工具表 / 接入 MCP 客户端）、`RUN.md`
+  （5 分钟跑通 + 数据源策略）、`docs/architecture.md`（分层与 SDK 约束）、
+  `mcp-config.json`（Claude Desktop / Cursor 配置模板，含 `--directory` 占位符）
 
 生成一份简报：
 
