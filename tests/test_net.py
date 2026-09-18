@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import gzip
 import socket
 from collections.abc import Iterator
 from typing import Protocol
@@ -82,6 +83,19 @@ def _response(
         status_code=status,
         content=content,
         headers=headers,
+        request=httpx.Request("GET", url),
+    )
+
+
+def _streamed_response(url: str, content: bytes, **headers: str) -> httpx.Response:
+    """构造「流式」响应：带压缩头但不预先解码，与 ``httpx.stream`` 的真实行为一致。
+
+    用 ``content=`` 构造的响应会在初始化时就把压缩头当回事，测不出重建时的问题。
+    """
+    return httpx.Response(
+        status_code=200,
+        headers=headers,
+        stream=httpx.ByteStream(content),
         request=httpx.Request("GET", url),
     )
 
@@ -234,6 +248,34 @@ def test_redirect_within_the_public_internet_is_followed(monkeypatch: pytest.Mon
 
     assert response.content == b"done"
     assert seen == ["https://example.com/old", "https://example.com/new"]
+
+
+def test_a_compressed_response_is_not_decoded_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """实测踩过的坑：重建响应时照抄了压缩头，httpx 会把已解压的内容**再解一次**。
+
+    表现为 `DecodingError: incorrect header check`，后果是**整条新闻与 PDF 链路静默
+    降级成 mock**——端到端跑一次才发现。这里的假响应刻意用「流式」构造，好让它带上
+    真实的 `content-encoding` 与压缩前的 `content-length`。
+    """
+    plain = b"<rss>" + b"x" * 200 + b"</rss>"
+    compressed = gzip.compress(plain)
+    assert len(compressed) != len(plain), "这组数据要能区分「重算」与「照抄」"
+    stream, _ = _fake_stream(
+        _streamed_response(
+            "https://example.com/feed",
+            compressed,
+            **{"content-encoding": "gzip", "content-length": str(len(compressed))},
+        )
+    )
+    monkeypatch.setattr(httpx, "stream", stream)
+
+    response = net.get_capped(
+        "https://example.com/feed", max_bytes=1024, source_name="t", timeout=1.0
+    )
+
+    assert response.content == plain
+    assert "content-encoding" not in response.headers, "解压标记留着就会再解一次"
+    assert response.headers["content-length"] == str(len(plain)), "长度也要按新内容重算"
 
 
 def test_chunks_are_read_incrementally() -> None:

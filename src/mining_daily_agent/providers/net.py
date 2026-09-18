@@ -33,6 +33,10 @@ MAX_REDIRECTS: Final = 5
 CHUNK_BYTES: Final = 64 * 1024
 #: 无需 DNS 即可断定的本机主机名。
 LOCAL_HOSTNAMES: Final[frozenset[str]] = frozenset({"localhost", "localhost.localdomain"})
+#: 重建响应时丢弃的响应头：内容已被 ``iter_bytes`` 解压，这些头描述的是压缩前的字节。
+DROPPED_HEADERS: Final[frozenset[str]] = frozenset(
+    {"content-encoding", "content-length", "transfer-encoding"}
+)
 
 type IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -192,7 +196,21 @@ def _read_capped(response: httpx.Response, *, max_bytes: int, source_name: str) 
         chunks.append(chunk)
     return httpx.Response(
         status_code=response.status_code,
-        headers=response.headers,
+        headers=_decoded_headers(response.headers),
         content=b"".join(chunks),
         request=response.request,
+    )
+
+
+def _decoded_headers(headers: httpx.Headers) -> httpx.Headers:
+    """重建响应时丢掉与**压缩**有关的头。
+
+    ``iter_bytes`` 交出来的已经是解压后的字节，而原响应头里还写着
+    ``content-encoding: gzip`` 与压缩前的 ``content-length``——照抄过去，httpx 在
+    重建那一刻会**再解压一次**，实测直接抛
+    ``DecodingError: incorrect header check``，整条新闻与 PDF 链路静默降级成 mock。
+    这个坑只有端到端真跑一次才会暴露（单测里的假响应不带这些头）。
+    """
+    return httpx.Headers(
+        [(name, value) for name, value in headers.items() if name.casefold() not in DROPPED_HEADERS]
     )
