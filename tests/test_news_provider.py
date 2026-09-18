@@ -247,6 +247,32 @@ def test_mock_provider_has_exactly_eight_items() -> None:
     assert len(mock_module._SPECS) == 8
 
 
+def test_mock_provider_marks_items_as_degraded() -> None:
+    """条目带真实的标题、来源与域名，不标记就与真实报道无从分辨。"""
+    items = MockNewsProvider().search("anything", days=7)
+
+    assert items
+    assert all(item.degraded for item in items)
+
+
+def test_mock_provider_marks_articles_as_degraded() -> None:
+    provider = MockNewsProvider()
+    known = provider.search("anything", days=7)[0]
+
+    assert provider.fetch_article(known.url).degraded
+    assert provider.fetch_article("https://example.com/unknown").degraded
+
+
+def test_real_provider_results_are_not_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实解析出的条目绝不能带降级标记，否则简报会误标可信数据。"""
+    monkeypatch.setattr(rss, "_http_get", _stub_get(_feed(age_days=0.1)))
+
+    items = RssNewsProvider().search("pilbara lithium", days=1)
+
+    assert items
+    assert not any(item.degraded for item in items)
+
+
 def test_mock_provider_filters_by_days() -> None:
     provider = MockNewsProvider()
 

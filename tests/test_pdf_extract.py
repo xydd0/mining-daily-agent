@@ -472,6 +472,23 @@ def test_mock_indicated_matches_pilgangoora_magnitude() -> None:
     assert all(item.commodity == "Li2O" for item in indicated)
 
 
+def test_mock_report_is_marked_as_degraded() -> None:
+    """合成吨位必须带结构化标记，否则简报会把它当真实资源量呈现。"""
+    report = build_mock_report(REPORT_URL)
+
+    assert report.degraded
+
+
+def test_real_parse_is_not_marked_as_degraded(
+    monkeypatch: pytest.MonkeyPatch, report_pdf: bytes
+) -> None:
+    monkeypatch.setattr(pdf_parser, "_http_get", _stub_get(report_pdf))
+
+    report = PdfResourceProvider().extract_resources(REPORT_URL)
+
+    assert not report.degraded, "真实解析结果不能被误标为降级"
+
+
 def test_mock_provider_never_raises_for_any_url() -> None:
     report = MockPdfProvider().extract_resources("https://example.com/whatever.pdf")
 

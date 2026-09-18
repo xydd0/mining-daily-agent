@@ -69,6 +69,8 @@ def build_mock_report(pdf_url: str, now: datetime | None = None) -> ResourceRepo
             for spec in _SPECS
         ],
         raw_snippets=[MOCK_NOTICE, *(spec.snippet for spec in _SPECS)],
+        # 结构化标记：上层据此判断数据是不是编造的，比在 raw_snippets 里找文案可靠。
+        degraded=True,
     )
 
 

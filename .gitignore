@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# agent 生成的简报（每日本地产物，不入库）
+reports/
+
 # 虚拟环境
 .venv/
 venv/

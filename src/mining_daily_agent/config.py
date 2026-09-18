@@ -29,6 +29,8 @@ DEFAULT_MCP_SERVERS: Final[tuple[tuple[str, str], ...]] = (
 )
 #: 单次工具调用的默认超时秒数。
 DEFAULT_MCP_CALL_TIMEOUT_SECONDS: Final = 30.0
+#: 简报输出目录的默认值，可经 REPORTS_DIR 覆盖。
+DEFAULT_REPORTS_DIR: Final = Path("reports")
 
 
 class ConfigError(RuntimeError):
@@ -174,6 +176,26 @@ def load_config(env_file: Path | None = None) -> Config:
         config.news_days_default,
     )
     return config
+
+
+def reports_dir() -> Path:
+    """简报输出目录；经 ``REPORTS_DIR`` 覆盖，默认 ``reports/``。
+
+    做成可配置的另一个原因：测试要把它指到临时目录，否则跑一次测试就会往仓库里
+    写文件。
+    """
+    raw = os.getenv("REPORTS_DIR", "").strip()
+    return Path(raw) if raw else DEFAULT_REPORTS_DIR
+
+
+def default_report_url() -> str:
+    """新闻里找不到资源报告 PDF 时的兜底年报 URL；未配置时返回空串。
+
+    这里**故意不设非空默认值**：真实年报地址随公司而异，硬编码一个占位地址只会让
+    ``pdf.extract_resources`` 每次都失败并悄悄降级成 mock 数据。留空时上层会跳过
+    取数并记一条风险提示，比返回编造的数据诚实。
+    """
+    return os.getenv("DEFAULT_REPORT_URL", "").strip()
 
 
 def load_mcp_client_config(env_file: Path | None = None) -> McpClientConfig:

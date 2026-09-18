@@ -17,9 +17,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `servers/pdf_server.py` — `mineral-pdf-mcp`：`extract_resources`
 - `servers/price_server.py` — `lme-price-mcp`：`get_price` / `get_trend`
 - `client/pool.py` — `McpConnectionPool`：并发连接三个 server、汇总工具、路由调用
+- `agent/` — `state.py`（`BriefState` / `FetchPlan`）、`llm.py`（DeepSeek 客户端）、
+  `nodes.py`（planner → fetch_data → analyze → synthesize → render）、`graph.py`（`run_daily_brief`）
+- `src/mining_daily_agent/__main__.py` — CLI：`uv run python -m mining_daily_agent "<主题>"`
 - `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
-- `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现，待接入实际流程
-- **没有 CI**；`README.md` 仍为空文件
+- `src/mining_daily_agent/__init__.py` 只有包说明；命令行入口统一在 `__main__.py`
+  （`python -m mining_daily_agent` 与 console script `mining-daily-agent` 都走它）
+- **CI 已接入**（`.github/workflows/ci.yml`，跑同一套四项门禁）；`README.md` 仍为空文件
+
+生成一份简报：
+
+```bash
+uv run python -m mining_daily_agent "给我生成一份关于 Pilbara 锂矿的今日简报"
+```
+
+产物写到 `reports/YYYY-MM-DD-<slug>.md`（该目录已 gitignore）。可选环境变量：
+`REPORTS_DIR`、`DEFAULT_REPORT_URL`（新闻里找不到 PDF 时的兜底年报地址）。
 
 启动单个 MCP server（stdio）：
 
@@ -42,7 +55,8 @@ uv run python scripts/verify_pool.py
 - **包管理只能用 `uv`**（存在 `uv.lock`，build-backend 为 `uv_build`）。不要用 pip / poetry / conda 直接操作环境。
 - **Python 3.12**（`.python-version` 与 `pyproject.toml` 的 `requires-python = ">=3.12"` 一致）。注意系统默认 `python` 是 3.14，务必通过 `uv run` 调用，不要裸跑 `python`。
 - 采用 **src 布局**：代码放 `src/mining_daily_agent/`，`uv_build` 要求保持该结构。子包划分见「代码组织」。
-- 入口点：`mining_daily_agent:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
+- 入口点：`mining_daily_agent.__main__:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
+  **只有这一个** CLI 实现；改动它时 `tests/test_entrypoint.py` 会校验脚本目标没有分叉。
 - `pydantic` 已显式声明进 `dependencies`（此前只靠 `mcp` 传递依赖，属隐患）。
 
 ## 代码组织
@@ -114,6 +128,24 @@ src/mining_daily_agent/
   `sys.executable -m <module>`（连接池本就跑在项目 venv 里，不必再经 `uv run` 解析一层）。
   改回 `uv run`：设 `MCP_SERVER_LAUNCHER=uv`、`MCP_SERVER_LAUNCHER_ARGS="run python"`。
 
+### Agent 编排的实现约束
+
+- **`agent/state.py` 不能加 `from __future__ import annotations`**（也不能把模型导入塞进
+  `TYPE_CHECKING`）。LangGraph 构建图时会运行时解析状态注解，实测会直接抛
+  `NameError: name 'NewsItem' is not defined`——与 pydantic、MCP 是同一类陷阱。
+- **工具返回的列表被 FastMCP 包了一层 `{"result": [...]}`**，且 `content` 里每个元素
+  各占一个文本块——只读 `content[0]` 会静默丢掉除第一条以外的全部数据。解析一律走
+  `structured_content`（`nodes._payload_from_result`）。
+- **`FetchPlan.keywords` 要能接受数组**。实测 LLM 很自然地返回
+  `["Pilbara lithium mine", "Pilgangoora", ...]`；只收字符串会让计划白白回退成默认值
+  （默认关键词是整条中文主题，Google News 搜不到东西，进而整条数据链降级成 mock）。
+- **降级数据必须显式披露**。`NewsItem` / `Article` / `ResourceReport` 都有 `degraded`
+  字段，两个 mock provider 一律置 `True`；`fetch_data` 据此写风险提示、`build_citations`
+  与资料块逐条加 `【降级示例数据】` 标记。**新建数据源时必须沿用这个字段**——mock 新闻
+  带真实的标题、来源与域名，不标记的话上层根本分不出真伪。
+- **挑 PDF 源要分两轮**：先找 `.pdf` 链接，再退回线索词匹配。矿业公司名里带
+  "Resources" 极常见，一轮混判会把普通新闻页当成报告。
+
 ### 价格工具的代理品种陷阱（重要）
 
 `lme-price-mcp` 返回的**不是 LME 金属价**。LME 现货行情没有免费 API，真实源只能用
@@ -138,37 +170,49 @@ src/mining_daily_agent/
 - **每次提交前必须依次通过以下四项，全绿才允许提交**：
 
 ```bash
-uv run ruff check .
-uv run ruff format --check
-uv run mypy src
-uv run pytest
+bash scripts/gate.sh
 ```
 
-`ruff format --check` 是后补的一项。原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。pre-commit 的 `ruff format` 钩子会自动改文件，但**用 `git commit` 绕过 pre-commit 时就没有这道网**，此时 `--check` 是唯一拦截点。
+**`scripts/gate.sh` 是门禁命令的唯一来源**，它依次跑四项：`ruff check .` →
+`ruff format --check` → `mypy` → `pytest`。CLAUDE.md、`.pre-commit-config.yaml` 与
+`.github/workflows/ci.yml` 都只调这个脚本，**不要在任何地方重复列出具体命令**——
+此前三处各写一份，改一处漏一处就会「本地过了但 CI 挂了」。
+
+脚本刻意不加 `set -e`：四项都跑完再汇总，一次看到全部问题。任一项失败则以非零码退出。
+
+其中两项是补上来的，原因都是「看起来过了，其实没查」：
+
+- `ruff format --check`：原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。
+- `mypy` 由 `mypy src` 放宽而来：带 `src` 参数会**覆盖 `pyproject.toml` 的 `files` 列表**，只检查 src；`tests/` 与 `scripts/` 的类型错误因此长期无人发现（实跑裸 `mypy` 才暴露两处）。
+
+注意门禁是**只检查、不修改**的：提交被拦下时自己跑 `uv run ruff format` 与
+`uv run ruff check --fix .` 修好再提交（早先 pre-commit 的自动修复钩子已随统一而移除）。
 
 ## 常用命令
 
 ```bash
 uv sync                    # 安装/同步依赖
-uv run mining-daily-agent  # 运行入口点（当前仅打印占位字符串）
+uv run mining-daily-agent "<主题>"   # 与 `python -m mining_daily_agent` 等价
 uv add <package>           # 新增运行时依赖
 uv add --dev <package>     # 新增开发依赖
 
-# 提交前三件套，必须全绿（见「提交规范」）
-uv run ruff check .
-uv run mypy src
-uv run pytest --cov=mining_daily_agent --cov-fail-under=70
+# 提交前门禁：四项依次跑完并汇总，全绿才算过（见「提交规范」）
+bash scripts/gate.sh
 
 # 跑单个测试/单个文件：必须带 --no-cov，否则全局覆盖率门槛必然不达标而报错
 uv run pytest tests/test_pdf_extract.py -v --no-cov
 uv run pytest tests/test_pdf_extract.py::test_name -v --no-cov
 
-uv run ruff format         # 格式化
+uv run ruff format         # 格式化（门禁只检查不修改，被拦下时自己跑）
+uv run ruff check --fix .  # 自动修可修的 lint 问题
 ```
 
 `ruff` / `mypy` / `pytest` 的配置都在 `pyproject.toml`。其中 ruff 的 `ignore` **刻意关闭了 `RUF001`/`RUF002`/`RUF003`**——它们会把中文全角标点判为「易混淆字符」，对本项目纯属误报，不要重新开启。
 
-`.pre-commit-config.yaml` 用的是 `language: system` + `uv run` 的本地钩子：复用项目自身的 uv 环境，避免 mypy 在隔离环境里看不到依赖而全量报 unresolved import。注意 **`--all-files` 在仓库还没有 commit 时会跳过全部钩子**（`git ls-files` 为空，显示 "no files to check"），要验证钩子得显式传路径：`uv run pre-commit run --files <路径...>`。
+`.pre-commit-config.yaml` 只有一个钩子，就是调 `bash scripts/gate.sh`；用 `language: system` 复用项目自身的 uv 环境（若改用单独的 hook 仓库，mypy 会在看不到依赖的隔离环境里全量报 unresolved import）。注意两点：
+
+- **`--all-files` 在仓库还没有 commit 时会跳过全部钩子**（`git ls-files` 为空，显示 "no files to check"），要验证钩子得显式传路径：`uv run pre-commit run --files <路径...>`。
+- 钩子带 `types_or: [python, pyi]`，**只改到 Python 文件时才跑**——门禁含 pytest（约 10 秒），纯文档提交不必付这个代价。
 
 ## 环境变量契约
 
@@ -200,3 +244,10 @@ uv run ruff format         # 格式化
 - 采集：`feedparser`（RSS/Atom）、`httpx`（异步 HTTP）、`beautifulsoup4` + `lxml`（HTML 解析）、`pdfplumber`（PDF 文本抽取）
 - 编排：`langgraph`（agent 图/工作流）、`langchain-openai`（LLM 客户端）
 - 交付：`mcp[cli]` —— 将暴露为三个 MCP server（stdio 传输），见「MCP 约定」
+
+## 已知缺口
+
+1. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
+   `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
+2. **门禁脚本只检查、不修改**。早先 pre-commit 的 `ruff --fix` / `ruff format` 钩子会
+   顺手改文件，统一后没有了；提交被拦下需要手工跑一次格式化。
