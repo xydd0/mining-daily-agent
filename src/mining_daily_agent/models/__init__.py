@@ -3,5 +3,16 @@
 from __future__ import annotations
 
 from mining_daily_agent.models.news import Article, NewsItem
+from mining_daily_agent.models.resources import (
+    ResourceCategory,
+    ResourceItem,
+    ResourceReport,
+)
 
-__all__ = ["Article", "NewsItem"]
+__all__ = [
+    "Article",
+    "NewsItem",
+    "ResourceCategory",
+    "ResourceItem",
+    "ResourceReport",
+]

@@ -4,18 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 当前状态
 
-新闻链路已打通（`models` → `providers` → `servers`），其余仍是骨架：
+新闻与 PDF 两条链路已打通（`models` → `providers` → `servers`），`client` 仍是空白：
 
 - `src/mining_daily_agent/config.py` — 环境变量集中读取与校验，缺失时抛 `ConfigError`
 - `src/mining_daily_agent/models/news.py` — `NewsItem` / `Article`（pydantic）
+- `src/mining_daily_agent/models/resources.py` — `ResourceCategory` / `ResourceItem` / `ResourceReport`
 - `src/mining_daily_agent/providers/news/` — `base.py`（`NewsProvider` Protocol）、`rss.py`（真实实现，3 个 RSS 源）、`mock.py`（降级实现，8 条内置数据）
-- `src/mining_daily_agent/servers/news_server.py` — `mining-news-mcp`，注册 `search` / `fetch_article` 两个工具
+- `src/mining_daily_agent/providers/pdf/` — `base.py`（`PdfProvider` Protocol）、`parser.py`（pdfplumber + 正则抽取）、`mock.py`（Pilgangoora 风格资源表）
+- `src/mining_daily_agent/servers/news_server.py` — `mining-news-mcp`：`search` / `fetch_article`
+- `src/mining_daily_agent/servers/pdf_server.py` — `mineral-pdf-mcp`：`extract_resources`
 - `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现，待接入实际流程
 - 「代码组织」中的 `client` 是**目标结构，尚未创建**
 - **没有 CI**；`README.md` 仍为空文件
-- git 仓库仍**没有任何 commit**
 
-启动 MCP server：`uv run python -m mining_daily_agent.servers.news_server`（stdio）
+启动 MCP server（stdio）：
+
+```bash
+uv run python -m mining_daily_agent.servers.news_server
+uv run python -m mining_daily_agent.servers.pdf_server
+```
 
 `pyproject.toml` 里的依赖声明的是**意图**，不是已实现的架构。在补全代码前，不要假设「代码组织」中列出的任何子包或模块已存在——请先 `ls src/mining_daily_agent/` 确认。
 
@@ -81,14 +88,17 @@ src/mining_daily_agent/
 
 ## 提交规范
 
-- 使用 **Conventional Commits**（`feat:` / `fix:` / `refactor:` / `docs:` / `test:` / `chore:` 等）。
-- **每次提交前必须依次通过以下三项，全绿才允许提交**：
+- 使用 **Conventional Commits**（`feat:` / `fix:` / `refactor:` / `docs:` / `test:` / `style:` / `chore:` 等）。
+- **每次提交前必须依次通过以下四项，全绿才允许提交**：
 
 ```bash
 uv run ruff check .
+uv run ruff format --check
 uv run mypy src
 uv run pytest
 ```
+
+`ruff format --check` 是后补的一项。原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。pre-commit 的 `ruff format` 钩子会自动改文件，但**用 `git commit` 绕过 pre-commit 时就没有这道网**，此时 `--check` 是唯一拦截点。
 
 ## 常用命令
 
