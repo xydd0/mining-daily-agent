@@ -106,6 +106,11 @@ def _yahoo_payload(days: int = 40, start: float = 100.0) -> dict[str, object]:
     }
 
 
+def _primary_yahoo() -> dict[str, object]:
+    """首选源的标准返回：2026-09-14/15/16 三天，收盘价 70.0 / 71.0 / 72.0。"""
+    return _yahoo_payload(days=3, start=70.0)
+
+
 def _points(prices: list[float]) -> list[PricePoint]:
     start = date(2026, 1, 1)
     return [
@@ -249,31 +254,31 @@ def test_trend_series_rejects_an_inverted_range() -> None:
 
 
 def test_get_price_for_explicit_date(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
 
     point = StooqPriceProvider().get_price("lithium", "2026-09-15")
 
     assert point.date == date(2026, 9, 15)
-    assert point.price == pytest.approx(71.5)
+    assert point.price == pytest.approx(71.0)
     assert point.currency == "USD"
 
 
 def test_get_price_without_date_takes_the_latest_trading_day(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
 
     point = StooqPriceProvider().get_price("lithium", None)
 
     assert point.date == date(2026, 9, 16)
-    assert point.price == pytest.approx(70.4)
+    assert point.price == pytest.approx(72.0)
 
 
 def test_real_quote_is_labelled_as_a_proxy_not_a_metal_price(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """代理品种是上市份额，绝不能标成 USD/t，否则 LLM 会把股价当金属价引用。"""
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
 
     point = StooqPriceProvider().get_price("lithium", None)
 
@@ -283,7 +288,7 @@ def test_real_quote_is_labelled_as_a_proxy_not_a_metal_price(
 
 def test_get_trend_labels_every_point_as_a_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """真实源拿到的走势，每个点都必须带代理标记——不能只标顶层的 source。"""
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
 
     series = StooqPriceProvider().get_trend("lithium", 3)
 
@@ -291,13 +296,13 @@ def test_get_trend_labels_every_point_as_a_proxy(monkeypatch: pytest.MonkeyPatch
     assert all(point.unit == "USD/share" for point in series.points)
     assert all("proxy" in point.source for point in series.points)
     assert series.source == series.points[0].source
-    assert series.change_pct == pytest.approx((70.4 - 70.9) / 70.9 * 100, abs=1e-3)
+    assert series.change_pct == pytest.approx((72.0 - 70.0) / 70.0 * 100, abs=1e-3)
 
 
 def test_missing_date_reports_the_nearest_available_day(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
 
     with pytest.raises(ToolError, match="最近的可交易日是 2026-09-16"):
         price_server.get_price(commodity="lithium", date="2026-09-20")
@@ -309,7 +314,7 @@ def test_bad_date_format_is_rejected() -> None:
 
 
 def test_commodity_aliases_work_through_the_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(yahoo_payload=_primary_yahoo()))
 
     point = price_server.get_price(commodity="Li")
 
@@ -319,16 +324,42 @@ def test_commodity_aliases_work_through_the_tool(monkeypatch: pytest.MonkeyPatch
 # --- 场景 2：真实源失败降级 mock ---------------------------------------------
 
 
-def test_falls_back_to_yahoo_when_stooq_is_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_yahoo_is_tried_before_stooq(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个源都可用时必须用 Yahoo——Stooq 必然被反爬拦下，放首位每次白等约 5 秒。"""
     monkeypatch.setattr(
-        price_stooq, "_http_get", _stub(yahoo_payload=_yahoo_payload(days=5, start=20.0))
+        price_stooq,
+        "_http_get",
+        _stub(stooq_text=CSV_TEXT, yahoo_payload=_primary_yahoo()),
     )
-    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
 
-    point = StooqPriceProvider().get_price("copper", None)
+    point = StooqPriceProvider().get_price("lithium", None)
 
     assert "Yahoo Finance" in point.source
-    assert point.price == pytest.approx(24.0)
+    assert point.price == pytest.approx(72.0)
+
+
+def test_source_priority_is_yahoo_then_stooq() -> None:
+    assert [source.name for source in price_stooq.SOURCES] == ["Yahoo Finance", "Stooq"]
+
+
+def test_each_source_uses_its_own_symbol() -> None:
+    proxy = resolve_proxy("lithium")
+
+    symbols = {source.name: source.symbol_of(proxy) for source in price_stooq.SOURCES}
+
+    assert symbols == {"Yahoo Finance": "LIT", "Stooq": "lit.us"}
+
+
+def test_falls_back_to_stooq_when_yahoo_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stooq 保留为兜底：Yahoo 挂掉时仍能取到数据。"""
+    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    point = StooqPriceProvider().get_price("lithium", None)
+
+    assert "Stooq" in point.source
+    assert point.date == date(2026, 9, 16)
+    assert point.price == pytest.approx(70.4)
 
 
 def test_factory_falls_back_to_mock_when_init_fails(
@@ -416,7 +447,7 @@ def test_provider_level_unsupported_commodity_maps_to_a_tool_error(
 
 def test_unsupported_commodity_is_not_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """品种不支持是合法否定，降级只会拿到别的品种的合成数据。"""
-    monkeypatch.setattr(price_stooq, "_http_get", _stub(stooq_text=CSV_TEXT))
+    monkeypatch.setattr(price_stooq, "_http_get", _stub())
 
     with pytest.raises(ToolError, match="不支持的品种"):
         price_server.get_price(commodity="gold")

@@ -1,9 +1,9 @@
-"""真实价格数据源：Stooq 优先，Yahoo Finance 兜底。
+"""真实价格数据源：Yahoo Finance 优先，Stooq 兜底。
 
 **为什么是两个源**：LME 金属现货行情没有免费 API，只能用上市代理品种代替
 （见 ``PROXY_SYMBOLS``）。而 Stooq 的免费 CSV 端点已被 JavaScript 工作量证明
 反爬挡住——实测默认 UA 返回 404、浏览器 UA 返回挑战页，任何非 JS 客户端都拿不到
-数据。因此保留 Stooq 实现（万一其策略调整）并由 Yahoo Finance 兜底。
+数据。因此改用 Yahoo Finance 作为首选，Stooq 降为兜底保留（其策略调整后仍可用）。
 
 **代理品种的含义**：取到的是上市工具（ETF / 矿业公司）的**份额价格**，
 不是每吨金属价，也不是伦敦现货报价。这一点会写进 ``PricePoint.unit`` 与
@@ -280,13 +280,26 @@ class PriceSource:
     """一个行情源。"""
 
     name: str
+    symbol_of: Callable[[ProxySymbol], str]
     fetch: Callable[[ProxySymbol], list[tuple[date, float]]]
 
 
 #: 按优先级排列的行情源，顺序即尝试顺序。
+#:
+#: **Yahoo 在前、Stooq 在后**：Stooq 的 CSV 端点被 JS 反爬挡住，每次请求必然失败
+#: 并耗尽三次重试与退避（实测约 5 秒）才轮到下一个源。把它放在首位等于每次调用
+#: 先白等。Stooq 实现保留为兜底——若其反爬策略调整，调换这里两行即可恢复。
 SOURCES: Final[tuple[PriceSource, ...]] = (
-    PriceSource(name="Stooq", fetch=_fetch_from_stooq),
-    PriceSource(name="Yahoo Finance", fetch=_fetch_from_yahoo),
+    PriceSource(
+        name="Yahoo Finance",
+        symbol_of=lambda proxy: proxy.yahoo,
+        fetch=_fetch_from_yahoo,
+    ),
+    PriceSource(
+        name="Stooq",
+        symbol_of=lambda proxy: proxy.stooq,
+        fetch=_fetch_from_stooq,
+    ),
 )
 
 
@@ -301,7 +314,7 @@ def _fetch_daily_closes(proxy: ProxySymbol) -> tuple[list[tuple[date, float]], s
     """
     attempts: list[str] = []
     for source in SOURCES:
-        symbol = proxy.stooq if source.name == "Stooq" else proxy.yahoo
+        symbol = source.symbol_of(proxy)
         try:
             rows = source.fetch(proxy)
         except PriceFetchError as exc:
