@@ -1,0 +1,37 @@
+{
+  "mcpServers": {
+    "mining-news-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "<REPO_PATH>",
+        "python",
+        "-m",
+        "mining_daily_agent.servers.news_server"
+      ]
+    },
+    "mineral-pdf-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "<REPO_PATH>",
+        "python",
+        "-m",
+        "mining_daily_agent.servers.pdf_server"
+      ]
+    },
+    "lme-price-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "<REPO_PATH>",
+        "python",
+        "-m",
+        "mining_daily_agent.servers.price_server"
+      ]
+    }
+  }
+}
