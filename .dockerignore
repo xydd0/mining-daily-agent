@@ -1,0 +1,31 @@
+# 构建上下文排除项。
+#
+# 头等重要：.env 绝不能进镜像。里面有真实 LLM_API_KEY，一旦 COPY 进层里，
+# 就算后续层删掉也仍留在镜像历史中。运行时由 docker-compose 的 env_file 注入。
+.env
+.env.*
+
+# 本地虚拟环境与缓存：镜像里会用 uv sync 重新装一份，拷进去只会拖慢构建、撑大镜像。
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 运行期产物：简报写到容器内的 reports/，宿主机的历史简报没必要进构建上下文。
+reports/
+
+# 版本控制与 CI 配置，镜像里用不到。
+.git/
+.github/
+.gitattributes
+
+# 开发期文件：镜像只跑 CLI，不需要测试、验收脚本与文档。
+tests/
+scripts/
+CLAUDE.md
+.pre-commit-config.yaml
