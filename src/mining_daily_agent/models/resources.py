@@ -72,3 +72,10 @@ class ResourceReport(BaseModel):
             "Inspect these when `resources` is empty to judge why nothing matched."
         ),
     )
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when these figures are synthesized fallback data rather than a "
+            "parsed report. NEVER present degraded figures as real: say so explicitly."
+        ),
+    )

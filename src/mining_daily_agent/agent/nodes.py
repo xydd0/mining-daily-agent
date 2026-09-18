@@ -22,7 +22,6 @@ from mining_daily_agent.config import default_report_url, reports_dir
 from mining_daily_agent.models.news import NewsItem
 from mining_daily_agent.models.prices import TrendSeries
 from mining_daily_agent.models.resources import ResourceCategory, ResourceReport
-from mining_daily_agent.providers.pdf.mock import MOCK_NOTICE as PDF_MOCK_NOTICE
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -98,6 +97,8 @@ RISK_KEYWORDS: Final[tuple[str, ...]] = (
 )
 #: 判断一条新闻是否可能指向资源报告的线索词。
 RESOURCE_HINTS: Final = ("resource", "reserve", "mineral", "feasibility", "report")
+#: 来源里给降级数据加的后缀，提醒读者这不是真实数据。
+DEGRADED_MARK: Final = "【降级示例数据】"
 #: 文件名里保留的字符：Unicode 字母数字、下划线、连字符（中文因此得以保留）。
 _SLUG_STRIP_RE: Final = re.compile(r"[^\w\-]+", re.UNICODE)
 #: 从可能带代码围栏的文本里抓第一个 JSON 对象。
@@ -122,6 +123,8 @@ _SYNTHESIZE_PROMPT: Final = """你是矿业分析师。请根据下方资料，�
 - 用 Markdown，按需包含「## 概览」「## 价格与走势」「## 资源量」「## 风险提示」小节
 - **每条事实后面必须用 [编号] 标注来源**，编号对应「编号来源」清单
 - 资料里没有的数字一律不要编造；缺失的小节直接省略，不要写占位符
+- **标有「{degraded_mark}」的资料不是真实数据**：引用时必须写明它不可采信，
+  绝不能当作真实报道或真实资源量陈述
 - 正文控制在 400 字以内
 
 ## 编号来源
@@ -331,6 +334,12 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
             news = _models_from_result(news_result, NewsItem)
         except AgentError as exc:
             notes.append(f"新闻源失败，已降级：{exc}")
+    if any(item.degraded for item in news):
+        # mock 新闻带真实标题、来源与域名，不做这一步简报会把合成内容当报道引用。
+        notes.append(
+            "新闻为降级后的示例数据（真实 RSS 源不可用），标题与来源均系伪造，"
+            "不得当作真实报道引用。"
+        )
 
     trend: TrendSeries | None = None
     if isinstance(price_result, BaseException):
@@ -355,9 +364,8 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
             except Exception as exc:  # 报告缺失不应中断简报，任何异常都只记风险
                 notes.append(f"资源报告解析失败，已降级：{type(exc).__name__}: {exc}")
 
-    if report is not None and PDF_MOCK_NOTICE in report.raw_snippets:
-        # PDF mock 会把降级声明放在 raw_snippets 首位。不把它转成风险提示的话，
-        # 简报会拿合成吨位当真实资源量呈现——那比报错更糟。
+    if report is not None and report.degraded:
+        # 合成吨位如果不加披露，简报会把它们当真实资源量呈现——那比报错更糟。
         notes.append("资源量为降级后的合成数据（PDF 未能真实解析），数值不可用于任何判断。")
 
     article = news[0] if news else None
@@ -436,10 +444,14 @@ def build_citations(state: BriefState) -> list[str]:
     synthesize 需要编号才能要求 LLM 标注 [n]，render 需要同一份编号出「来源」小节；
     两处都调用本函数，保证编号一致（它是纯函数，结果只取决于 state）。
     """
-    citations = [f"{item.title} — {item.url}（{item.source}）" for item in state["news"]]
+    citations = [
+        f"{item.title} — {item.url}（{item.source}{DEGRADED_MARK if item.degraded else ''}）"
+        for item in state["news"]
+    ]
     report = state["resource_report"]
     if report is not None:
-        citations.append(f"{report.project_name} 资源量报告 — {report.source_url}")
+        mark = DEGRADED_MARK if report.degraded else ""
+        citations.append(f"{report.project_name} 资源量报告 — {report.source_url}{mark}")
     trend = state["price_trend"]
     if trend is not None:
         citations.append(f"{trend.commodity} 价格数据 — {trend.source}")
@@ -453,7 +465,7 @@ def _synthesis_data(state: BriefState) -> str:
     if state["news"]:
         lines.append("### 新闻")
         lines.extend(
-            f"- [{index}] {item.title}：{item.summary}"
+            f"- [{index}] {DEGRADED_MARK if item.degraded else ''}{item.title}：{item.summary}"
             for index, item in enumerate(state["news"], 1)
         )
 
@@ -484,6 +496,7 @@ async def synthesize(state: BriefState) -> dict[str, object]:
         topic=state["topic"],
         sources=sources or "（无来源）",
         data=_synthesis_data(state),
+        degraded_mark=DEGRADED_MARK,
     )
     response = await build_llm().ainvoke(prompt)
     return {"markdown": _message_text(response).strip()}

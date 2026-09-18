@@ -138,9 +138,10 @@ src/mining_daily_agent/
 - **`FetchPlan.keywords` 要能接受数组**。实测 LLM 很自然地返回
   `["Pilbara lithium mine", "Pilgangoora", ...]`；只收字符串会让计划白白回退成默认值
   （默认关键词是整条中文主题，Google News 搜不到东西，进而整条数据链降级成 mock）。
-- **降级数据必须显式披露**。PDF mock 的降级声明放在 `raw_snippets[0]`，`fetch_data` 会
-  把它转成风险提示送进合成提示词——否则简报会把合成吨位当真实资源量呈现，比报错更糟。
-  ⚠️ **新闻 mock 目前没有对应声明**，其条目看起来与真实新闻无异（见「已知缺口」）。
+- **降级数据必须显式披露**。`NewsItem` / `Article` / `ResourceReport` 都有 `degraded`
+  字段，两个 mock provider 一律置 `True`；`fetch_data` 据此写风险提示、`build_citations`
+  与资料块逐条加 `【降级示例数据】` 标记。**新建数据源时必须沿用这个字段**——mock 新闻
+  带真实的标题、来源与域名，不标记的话上层根本分不出真伪。
 - **挑 PDF 源要分两轮**：先找 `.pdf` 链接，再退回线索词匹配。矿业公司名里带
   "Resources" 极常见，一轮混判会把普通新闻页当成报告。
 
@@ -233,11 +234,7 @@ uv run ruff format         # 格式化
 
 ## 已知缺口
 
-1. **新闻 mock 没有降级声明**。`providers/news/mock.py` 的条目带真实的标题、来源与 URL，
-   简报无法分辨它们是不是真的——实测在所有 RSS 源都失败时就会走到这里，而简报会把
-   合成新闻当真实报道引用。PDF mock 有 `MOCK_NOTICE` 且已被 agent 转成风险提示，
-   新闻侧需要同样的机制。
-2. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
+1. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
    `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
-3. **两个入口并存**：`pyproject.toml` 的 `mining-daily-agent` 指向 `__init__.py` 的占位
+2. **两个入口并存**：`pyproject.toml` 的 `mining-daily-agent` 指向 `__init__.py` 的占位
    `main()`，真正的 CLI 是 `__main__.py`。两者需要合一。

@@ -23,6 +23,13 @@ class NewsItem(BaseModel):
     summary: str = Field(
         description="Plain-text summary with HTML stripped, truncated to 500 characters."
     )
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when this item is synthesized fallback data rather than a real "
+            "article. NEVER present degraded items as reporting: say so explicitly."
+        ),
+    )
 
 
 class Article(BaseModel):
@@ -35,3 +42,10 @@ class Article(BaseModel):
     source: str = Field(description="Name of the publishing outlet.")
     published_at: datetime = Field(description="Publication time, timezone-aware (ISO-8601).")
     text: str = Field(description="Extracted plain-text body of the article.")
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when this is synthesized fallback data rather than a real article. "
+            "NEVER present degraded content as reporting: say so explicitly."
+        ),
+    )

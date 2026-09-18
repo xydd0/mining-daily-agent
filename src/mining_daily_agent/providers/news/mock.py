@@ -137,6 +137,9 @@ def build_mock_items(now: datetime | None = None) -> list[NewsItem]:
             source=spec.source,
             published_at=reference - timedelta(hours=spec.age_hours),
             summary=spec.summary,
+            # 必须标记：这些条目带真实的标题、来源与域名，不标记就与真实报道无从分辨，
+            # 上层会把合成内容当新闻引用（见 CLAUDE.md「已知缺口」）。
+            degraded=True,
         )
         for spec in _SPECS
     ]
@@ -171,6 +174,7 @@ class MockNewsProvider(NewsProvider):
                     source=item.source,
                     published_at=item.published_at,
                     text=item.summary,
+                    degraded=True,
                 )
         return Article(
             title=url,
@@ -178,4 +182,5 @@ class MockNewsProvider(NewsProvider):
             source=urlparse(url).netloc,
             published_at=datetime.now(UTC),
             text="（mock 降级数据：未内置该 URL 的正文。）",
+            degraded=True,
         )

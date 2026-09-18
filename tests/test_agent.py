@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, ContentBlock, TextContent
+from pydantic import SecretStr
 
 from mining_daily_agent import __main__ as cli_module
 from mining_daily_agent.agent import graph as graph_module
@@ -29,6 +30,7 @@ from mining_daily_agent.agent.llm import (
     build_chat_openai,
 )
 from mining_daily_agent.agent.nodes import (
+    DEGRADED_MARK,
     ToolCaller,
     analyze,
     build_citations,
@@ -44,7 +46,6 @@ from mining_daily_agent.config import Config, default_report_url, reports_dir
 from mining_daily_agent.models.news import NewsItem
 from mining_daily_agent.models.prices import PricePoint
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
-from mining_daily_agent.providers.pdf.mock import MOCK_NOTICE as PDF_MOCK_NOTICE
 from mining_daily_agent.providers.prices.base import build_trend_series
 
 TOPIC = "Pilbara 锂矿"
@@ -118,14 +119,18 @@ def _ok(payload: object) -> CallToolResult:
     列表会被包成 ``{"result": [...]}``，且 ``content`` 里**每个元素各占一个文本块**
     ——只读第一个文本块会丢数据，这个形态是刻意保留的。
     """
+    # content 的元素类型是 ContentBlock 联合（文本/图片/音频/链接/嵌入资源）。
+    # 直接传 list[TextContent] 会因 list 不变而被 mypy 拒绝，故按联合类型标注。
     if isinstance(payload, list):
-        content = [
+        blocks: list[ContentBlock] = [
             TextContent(type="text", text=json.dumps(item, ensure_ascii=False)) for item in payload
         ]
-        return CallToolResult(content=content, structured_content={"result": payload})
-    content = [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+        return CallToolResult(content=blocks, structured_content={"result": payload})
+    single: list[ContentBlock] = [
+        TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))
+    ]
     structured = payload if isinstance(payload, dict) else {}
-    return CallToolResult(content=content, structured_content=structured)
+    return CallToolResult(content=single, structured_content=structured)
 
 
 def _error(message: str) -> CallToolResult:
@@ -315,7 +320,7 @@ async def test_synthesised_resource_data_is_disclosed_as_a_risk(
     否则简报会拿合成吨位当真实资源量呈现——那比直接报错更糟。
     """
     payload = _report_payload()
-    payload["raw_snippets"] = [PDF_MOCK_NOTICE, "Indicated Mineral Resource: 214 Mt"]
+    payload["degraded"] = True
     responses = _responses()
     responses[("pdf", "extract_resources")] = _ok(payload)
     llm = _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
@@ -323,6 +328,36 @@ async def test_synthesised_resource_data_is_disclosed_as_a_risk(
     await run_daily_brief(TOPIC, pool=_FakePool(responses))
 
     assert "不可用于任何判断" in llm.prompts[-1], "降级声明必须进入合成提示词"
+
+
+async def test_degraded_news_is_disclosed_in_the_prompt_and_marked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mock 新闻带真实标题、来源与域名，不标注就会被当真实报道引用。"""
+    degraded = _news_payload()
+    for item in degraded:
+        item["degraded"] = True
+    responses = _responses()
+    responses[("news", "search")] = _ok(degraded)
+    llm = _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    prompt = llm.prompts[-1]
+    assert "不得当作真实报道引用" in prompt, "降级新闻必须留下风险提示"
+    assert DEGRADED_MARK in prompt, "资料块里应逐条标出降级条目"
+    assert DEGRADED_MARK in document, "来源小节应标出降级条目"
+
+
+async def test_real_data_is_not_marked_as_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实数据不能被打上降级标记，否则读者会以为整篇都不可信。"""
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert DEGRADED_MARK not in document
 
 
 async def test_missing_report_url_is_reported_as_a_risk(
@@ -718,5 +753,6 @@ def test_build_chat_openai_wires_base_url_and_timeout() -> None:
     assert client.openai_api_base == "https://api.deepseek.com"
     assert client.temperature == DEFAULT_TEMPERATURE
     assert client.request_timeout == DEFAULT_TIMEOUT_SECONDS
-    assert client.openai_api_key is not None
-    assert client.openai_api_key.get_secret_value() == "sk-test"
+    api_key = client.openai_api_key
+    assert isinstance(api_key, SecretStr), "密钥应以 SecretStr 保存，不会随 repr 泄漏"
+    assert api_key.get_secret_value() == "sk-test"
