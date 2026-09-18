@@ -12,6 +12,7 @@ import io
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, override
@@ -64,6 +65,28 @@ _TONNAGE_FACTORS: Final[dict[str, float]] = {
     "tonnes": 1.0,
     "t": 1.0,
 }
+
+# --- 表头单位推断用到的模式 -------------------------------------------------
+# 真实 NI 43-101 报告的表格几乎都是「表头写单位、单元格只放数字」，
+# 没有下面这组模式就只能抽到整句写法的少数文档。
+#: 表头里的吨位关键词。
+_TONNAGE_HEADER_RE: Final = re.compile(r"\b(?:tonnage|tonnes?|ore|resource)\b", re.IGNORECASE)
+#: 表头里的吨位单位，形如 "(Mt)"。
+_PAREN_TONNAGE_UNIT_RE: Final = re.compile(r"\(\s*(?P<unit>Mt|kt|t)\s*\)", re.IGNORECASE)
+#: 表头里的品位关键词。
+_GRADE_HEADER_RE: Final = re.compile(r"\bgrade\b", re.IGNORECASE)
+#: 表头里的品位单位，形如 "(% Li2O)"、"（g/t Au）"。
+_PAREN_GRADE_UNIT_RE: Final = re.compile(r"\(\s*(?P<unit>g/t|%)\s*[^)]*\)", re.IGNORECASE)
+#: 不带单位的裸数字，用于上述表格形态。
+_BARE_NUMBER_RE: Final = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+@dataclass(frozen=True, slots=True)
+class _UnitHints:
+    """从表头推断出的单位提示；取不到为 None。"""
+
+    tonnage_unit: str | None = None
+    grade_unit: str | None = None
 
 
 class PdfFetchError(RuntimeError):
@@ -161,14 +184,6 @@ def _tonnage_to_tonnes(value: str, unit: str) -> float:
     return float(value.replace(",", "")) * factor
 
 
-def _parse_grade(segment: str) -> tuple[float | None, str]:
-    """取段内第一个「数字 + %/g/t」，返回 (品位, 单位)。"""
-    match = _GRADE_RE.search(segment)
-    if match is None:
-        return None, ""
-    return float(match.group("value")), match.group("unit").lower()
-
-
 def _find_commodity(*candidates: str) -> str:
     """在候选文本中按给定顺序找矿种符号，找不到返回 ``unknown``。"""
     for text in candidates:
@@ -178,13 +193,73 @@ def _find_commodity(*candidates: str) -> str:
     return UNKNOWN_COMMODITY
 
 
-def _items_from_block(block: str) -> list[ResourceItem]:
+def _header_unit_hints(block: str) -> _UnitHints:
+    """从表头行里取单位提示，形如 ``Tonnage (Mt)``、``Grade (% Li2O)``。
+
+    只认「表头关键词 + 括号里的单位」这一最小形态，不做真正的列表格切分。
+    """
+    tonnage_unit: str | None = None
+    grade_unit: str | None = None
+    for line in block.splitlines():
+        if tonnage_unit is None and _TONNAGE_HEADER_RE.search(line):
+            match = _PAREN_TONNAGE_UNIT_RE.search(line)
+            if match is not None:
+                tonnage_unit = match.group("unit").lower()
+        if grade_unit is None and _GRADE_HEADER_RE.search(line):
+            match = _PAREN_GRADE_UNIT_RE.search(line)
+            if match is not None:
+                grade_unit = match.group("unit").lower()
+        if tonnage_unit is not None and grade_unit is not None:
+            break
+    return _UnitHints(tonnage_unit, grade_unit)
+
+
+def _overlaps(first: tuple[int, int], second: tuple[int, int]) -> bool:
+    """判断两个 span 是否相交。"""
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def _resolve_tonnage(
+    segment: str, header_unit: str | None
+) -> tuple[float | None, tuple[int, int] | None]:
+    """先按显式单位解析吨位；失败时若表头给了单位，取段内第一个裸数字。"""
+    match = _TONNAGE_RE.search(segment)
+    if match is not None:
+        return _tonnage_to_tonnes(match.group("value"), match.group("unit")), match.span()
+    if header_unit is None:
+        return None, None
+    bare = _BARE_NUMBER_RE.search(segment)
+    if bare is None:
+        return None, None
+    return float(bare.group(0).replace(",", "")) * _TONNAGE_FACTORS[header_unit], bare.span()
+
+
+def _resolve_grade(
+    segment: str, header_unit: str | None, consumed: tuple[int, int] | None
+) -> tuple[float | None, str]:
+    """先按显式单位解析品位；失败时若表头给了单位，取未被吨位占用的第一个裸数字。"""
+    match = _GRADE_RE.search(segment)
+    if match is not None:
+        return float(match.group("value")), match.group("unit").lower()
+    if header_unit is None:
+        return None, ""
+    for number in _BARE_NUMBER_RE.finditer(segment):
+        if consumed is not None and _overlaps(number.span(), consumed):
+            continue
+        return float(number.group(0).replace(",", "")), header_unit
+    return None, ""
+
+
+def _items_from_block(block: str, hints: _UnitHints) -> list[ResourceItem]:
     """在一个文本块内按类别切段，逐段抽取吨位与品位。
 
-    每个类别关键词开启一段，段的范围是它到下一个类别关键词之间；段内取
-    第一个吨位与第一个品位。这同时兼容
-    ``Indicated: 214 Mt @ 1.15% Li2O`` 的整句，
-    以及表格里 ``Indicated  214 Mt  1.15%`` 的逐行形态。
+    每个类别关键词开启一段，段的范围是它到下一个类别关键词之间。段内优先用
+    **自带单位**的写法（``Indicated: 214 Mt @ 1.15% Li2O``）；没有自带单位时退回
+    **表头推断**：表头给了吨位单位就按它解析段内第一个裸数字，给了品位单位就取
+    其后第一个未被占用的裸数字——即 ``Indicated  214  1.15`` 配
+    ``Category  Tonnage (Mt)  Grade (% Li2O)`` 的表格形态。
+
+    表头推断是启发式的，它假定表格列序为「吨位在前、品位在后」。
     """
     matches = list(_CATEGORY_RE.finditer(block))
     items: list[ResourceItem] = []
@@ -192,19 +267,17 @@ def _items_from_block(block: str) -> list[ResourceItem]:
         segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(block)
         segment = block[match.end() : segment_end]
 
-        tonnage_match = _TONNAGE_RE.search(segment)
-        if tonnage_match is None:
-            # 有类别关键词但没有可识别吨位：多半是表头或叙述句，跳过。
+        tonnage_t, consumed = _resolve_tonnage(segment, hints.tonnage_unit)
+        if tonnage_t is None:
+            # 既没有显式单位、表头也没给单位：(多半是表头或叙述句) 跳过。
             continue
 
-        grade, grade_unit = _parse_grade(segment)
+        grade, grade_unit = _resolve_grade(segment, hints.grade_unit, consumed)
         items.append(
             ResourceItem(
                 category=ResourceCategory(match.group("category").capitalize()),
                 commodity=_find_commodity(segment, block),
-                tonnage_t=_tonnage_to_tonnes(
-                    tonnage_match.group("value"), tonnage_match.group("unit")
-                ),
+                tonnage_t=tonnage_t,
                 grade=grade,
                 grade_unit=grade_unit,
             )
@@ -215,17 +288,27 @@ def _items_from_block(block: str) -> list[ResourceItem]:
 def parse_resource_text(text: str) -> tuple[list[ResourceItem], list[str]]:
     """从 PDF 文本中抽取资源量条目与溯源片段。
 
+    表头单位会**沿用到后续块**：PDF 文本提取常把表头与数据行切成两个块，
+    只在块内找表头会漏掉单位。
+
     Returns:
         ``(条目列表, 命中关键词的原文块列表)``。抽不到条目时第一个列表为空，
         第二个列表仍会给出候选原文。
     """
     items: list[ResourceItem] = []
     snippets: list[str] = []
+    hints = _UnitHints()
     for block in _blocks(text):
+        # 表头块本身可能不含类别关键词，因此先取提示、再做关键词过滤。
+        block_hints = _header_unit_hints(block)
+        hints = _UnitHints(
+            block_hints.tonnage_unit or hints.tonnage_unit,
+            block_hints.grade_unit or hints.grade_unit,
+        )
         if not _KEYWORD_RE.search(block):
             continue
         snippets.append(_truncate(block))
-        items.extend(_items_from_block(block))
+        items.extend(_items_from_block(block, hints))
     return items, snippets
 
 

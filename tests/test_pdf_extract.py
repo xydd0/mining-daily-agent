@@ -42,6 +42,32 @@ REPORT_LINES = [
     "Inferred Mineral Resource: 42 Mt at 1.02% Li2O",
 ]
 
+#: 表头写单位、单元格只放数字——真实 NI 43-101 报告的主流表格写法。
+TABLE_TEXT = (
+    "Category    Tonnage (Mt)    Grade (% Li2O)\n"
+    "Indicated   214             1.15\n"
+    "Inferred    89              1.05\n"
+)
+
+#: 同一张表，但表头与数据行被空行切成了两个块。
+TABLE_TEXT_SPLIT_BLOCKS = (
+    "Table 1: Mineral Resource Estimate\n"
+    "Category    Tonnage (Mt)    Grade (% Li2O)\n"
+    "\n"
+    "Indicated   214    1.15\n"
+    "Inferred    89     1.05\n"
+)
+
+#: 供 PDF 链路测试用的表格型正文。
+TABLE_LINES = [
+    "Pilgangoora Lithium Project",
+    "Table 1: Mineral Resource Estimate",
+    "",
+    "Category   Tonnage (Mt)   Grade (% Li2O)",
+    "Indicated  214           1.15",
+    "Inferred   89            1.05",
+]
+
 #: 一份「提到资源量但抽不出条目」的 PDF 正文。
 NO_FIGURES_LINES = [
     "Pilgangoora Lithium Project",
@@ -147,6 +173,80 @@ def test_grade_is_optional_for_an_item() -> None:
 
     assert items[0].grade is None
     assert items[0].grade_unit == ""
+
+
+# --- 表头单位推断（真实 NI 43-101 表格的主流写法）---------------------------
+
+
+def test_header_units_are_applied_to_bare_numbers() -> None:
+    items, _ = pdf_parser.parse_resource_text(TABLE_TEXT)
+
+    indicated = [i for i in items if i.category is ResourceCategory.INDICATED]
+    assert len(indicated) == 1
+    assert indicated[0].tonnage_t == pytest.approx(214e6)
+    assert indicated[0].grade == pytest.approx(1.15)
+    assert indicated[0].grade_unit == "%"
+    assert indicated[0].commodity == "Li2O"
+
+
+def test_header_tonnage_unit_kt_is_applied() -> None:
+    text = "Category  Tonnage (kt)  Grade (% Li2O)\nIndicated  1200  1.15\n"
+
+    items, _ = pdf_parser.parse_resource_text(text)
+
+    assert items[0].tonnage_t == pytest.approx(1_200_000.0)
+
+
+def test_header_grade_unit_g_per_tonne_is_applied() -> None:
+    text = "Category  Tonnage (Mt)  Grade (g/t Au)\nIndicated  12  1.85\n"
+
+    items, _ = pdf_parser.parse_resource_text(text)
+
+    assert items[0].grade == pytest.approx(1.85)
+    assert items[0].grade_unit == "g/t"
+    assert items[0].commodity == "Au"
+
+
+def test_header_without_unit_yields_no_items() -> None:
+    """表头没有单位时不做任何猜测，仍走空结果 + raw_snippets 路径。"""
+    text = "Category  Tonnage  Grade\nIndicated  214  1.15\n"
+
+    items, snippets = pdf_parser.parse_resource_text(text)
+
+    assert items == []
+    assert snippets, "抽不到条目时仍要给出候选原文"
+
+
+def test_explicit_units_win_over_header_hints() -> None:
+    text = "Category  Tonnage (kt)  Grade (% Li2O)\nIndicated  214 Mt at 0.9% Li2O\n"
+
+    items, _ = pdf_parser.parse_resource_text(text)
+
+    assert items[0].tonnage_t == pytest.approx(214e6), "应采信行内显式的 Mt，而非表头的 kt"
+    assert items[0].grade == pytest.approx(0.9)
+
+
+def test_header_hints_carry_across_blocks() -> None:
+    """PDF 文本提取常把表头与数据行切成两块，单位提示需要沿用下去。"""
+    items, _ = pdf_parser.parse_resource_text(TABLE_TEXT_SPLIT_BLOCKS)
+
+    indicated = [i for i in items if i.category is ResourceCategory.INDICATED]
+    assert len(indicated) == 1
+    assert indicated[0].tonnage_t == pytest.approx(214e6)
+    assert indicated[0].grade == pytest.approx(1.15)
+
+
+def test_extracts_from_table_style_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """表格写法经由真实 PDF 文本提取链路也要能抽出条目。"""
+    payload = _build_pdf(TABLE_LINES)
+    monkeypatch.setattr(pdf_parser, "_http_get", _stub_get(payload))
+
+    report = PdfResourceProvider().extract_resources(REPORT_URL)
+
+    indicated = [i for i in report.resources if i.category is ResourceCategory.INDICATED]
+    assert indicated, "表格型报告应能抽出 Indicated 条目"
+    assert indicated[0].tonnage_t == pytest.approx(214e6)
+    assert indicated[0].grade == pytest.approx(1.15)
 
 
 def test_resource_item_rejects_grade_without_unit() -> None:
