@@ -1,0 +1,14 @@
+# 一次性任务型容器：跑完输出简报即退出，没有需要常驻的服务。
+#
+# 用法：
+#   docker compose build
+#   docker compose run --rm agent "<主题>"     # 位置参数会覆盖下面的 command
+#   docker compose run --rm agent              # 不传则用默认主题
+services:
+  agent:
+    build: .
+    # 密钥与 LLM 配置在**运行时**注入。.env 已被 .dockerignore 挡在构建上下文之外，
+    # 不会进入镜像层。
+    env_file: .env
+    # 默认主题。`docker compose run --rm agent "<其它主题>"` 会用它替换整条 command。
+    command: ["给我生成一份关于 Pilbara 锂矿的今日简报"]

@@ -23,7 +23,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
 - `src/mining_daily_agent/__init__.py` 只有包说明；命令行入口统一在 `__main__.py`
   （`python -m mining_daily_agent` 与 console script `mining-daily-agent` 都走它）
-- **CI 已接入**（`.github/workflows/ci.yml`，跑同一套四项门禁）；`README.md` 仍为空文件
+- **CI 已接入**（`.github/workflows/ci.yml`，两个并行 job：`gate` 跑同一套四项门禁、
+  `docker-build` 验证镜像可构建并启用 GHA 层缓存）
+- **已容器化**：`Dockerfile`（多阶段）+ `docker-compose.yml`，见「容器化」
+- `README.md` 仍为空文件
 
 生成一份简报：
 
@@ -163,6 +166,24 @@ src/mining_daily_agent/
 
 不要把 Stooq 放回首位：它必然失败并耗尽三次重试与退避，等于每次调用先白跑约 5 秒。
 实测对调后单次调用从 7588ms 降到 729ms。
+
+## 容器化
+
+```bash
+docker compose build
+docker compose run --rm agent "<主题>"    # 位置参数覆盖默认 command
+```
+
+- **一个镜像必须装下 agent 与全部三个 MCP server**。它们不是独立服务，而是由 client
+  以 stdio 子进程拉起的（默认 `sys.executable -m <module>`），拆成多个容器根本跑不通。
+  已在容器内实测：`sys.executable = /app/.venv/bin/python`，三个 server 全部连上、5 个工具齐全。
+- 容器是**一次性任务**：跑完输出简报即退出，没有常驻进程与端口。简报写到容器内的
+  `reports/`，随容器销毁；要看内容就读 stdout。想留在宿主机就自己加卷
+  （`volumes: [./reports:/app/reports]`，注意 Linux 上会产出 root 属主的文件）。
+- **`.env` 绝不能进镜像**（`.dockerignore` 已排除，构建上下文里就没有），密钥由
+  `docker-compose.yml` 的 `env_file` 在运行时注入。
+- 构建用 `uv sync --no-editable`，项目真正装进 site-packages，runtime 层因此只拷 `.venv`、
+  不带源码。先用 `--no-install-project` 单装依赖，改代码不会让依赖层缓存失效。
 
 ## 提交规范
 
