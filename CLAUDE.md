@@ -17,9 +17,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `servers/pdf_server.py` — `mineral-pdf-mcp`：`extract_resources`
 - `servers/price_server.py` — `lme-price-mcp`：`get_price` / `get_trend`
 - `client/pool.py` — `McpConnectionPool`：并发连接三个 server、汇总工具、路由调用
+- `agent/` — `state.py`（`BriefState` / `FetchPlan`）、`llm.py`（DeepSeek 客户端）、
+  `nodes.py`（planner → fetch_data → analyze → synthesize → render）、`graph.py`（`run_daily_brief`）
+- `src/mining_daily_agent/__main__.py` — CLI：`uv run python -m mining_daily_agent "<主题>"`
 - `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
-- `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现，待接入实际流程
+- `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现（与 `__main__.py` 的 CLI 并存，
+  入口点 `mining-daily-agent` 目前指向它）
 - **没有 CI**；`README.md` 仍为空文件
+
+生成一份简报：
+
+```bash
+uv run python -m mining_daily_agent "给我生成一份关于 Pilbara 锂矿的今日简报"
+```
+
+产物写到 `reports/YYYY-MM-DD-<slug>.md`（该目录已 gitignore）。可选环境变量：
+`REPORTS_DIR`、`DEFAULT_REPORT_URL`（新闻里找不到 PDF 时的兜底年报地址）。
 
 启动单个 MCP server（stdio）：
 
@@ -114,6 +127,23 @@ src/mining_daily_agent/
   `sys.executable -m <module>`（连接池本就跑在项目 venv 里，不必再经 `uv run` 解析一层）。
   改回 `uv run`：设 `MCP_SERVER_LAUNCHER=uv`、`MCP_SERVER_LAUNCHER_ARGS="run python"`。
 
+### Agent 编排的实现约束
+
+- **`agent/state.py` 不能加 `from __future__ import annotations`**（也不能把模型导入塞进
+  `TYPE_CHECKING`）。LangGraph 构建图时会运行时解析状态注解，实测会直接抛
+  `NameError: name 'NewsItem' is not defined`——与 pydantic、MCP 是同一类陷阱。
+- **工具返回的列表被 FastMCP 包了一层 `{"result": [...]}`**，且 `content` 里每个元素
+  各占一个文本块——只读 `content[0]` 会静默丢掉除第一条以外的全部数据。解析一律走
+  `structured_content`（`nodes._payload_from_result`）。
+- **`FetchPlan.keywords` 要能接受数组**。实测 LLM 很自然地返回
+  `["Pilbara lithium mine", "Pilgangoora", ...]`；只收字符串会让计划白白回退成默认值
+  （默认关键词是整条中文主题，Google News 搜不到东西，进而整条数据链降级成 mock）。
+- **降级数据必须显式披露**。PDF mock 的降级声明放在 `raw_snippets[0]`，`fetch_data` 会
+  把它转成风险提示送进合成提示词——否则简报会把合成吨位当真实资源量呈现，比报错更糟。
+  ⚠️ **新闻 mock 目前没有对应声明**，其条目看起来与真实新闻无异（见「已知缺口」）。
+- **挑 PDF 源要分两轮**：先找 `.pdf` 链接，再退回线索词匹配。矿业公司名里带
+  "Resources" 极常见，一轮混判会把普通新闻页当成报告。
+
 ### 价格工具的代理品种陷阱（重要）
 
 `lme-price-mcp` 返回的**不是 LME 金属价**。LME 现货行情没有免费 API，真实源只能用
@@ -200,3 +230,14 @@ uv run ruff format         # 格式化
 - 采集：`feedparser`（RSS/Atom）、`httpx`（异步 HTTP）、`beautifulsoup4` + `lxml`（HTML 解析）、`pdfplumber`（PDF 文本抽取）
 - 编排：`langgraph`（agent 图/工作流）、`langchain-openai`（LLM 客户端）
 - 交付：`mcp[cli]` —— 将暴露为三个 MCP server（stdio 传输），见「MCP 约定」
+
+## 已知缺口
+
+1. **新闻 mock 没有降级声明**。`providers/news/mock.py` 的条目带真实的标题、来源与 URL，
+   简报无法分辨它们是不是真的——实测在所有 RSS 源都失败时就会走到这里，而简报会把
+   合成新闻当真实报道引用。PDF mock 有 `MOCK_NOTICE` 且已被 agent 转成风险提示，
+   新闻侧需要同样的机制。
+2. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
+   `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
+3. **两个入口并存**：`pyproject.toml` 的 `mining-daily-agent` 指向 `__init__.py` 的占位
+   `main()`，真正的 CLI 是 `__main__.py`。两者需要合一。

@@ -75,8 +75,14 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # tests/ 不被生产代码导入，注解所需的导入留在模块顶层更易读，故放开 TC00x；
-# ARG001 覆盖仅用于副作用的 fixture 参数（如 clean_os_env）。
-"tests/**" = ["ARG001", "TC001", "TC002", "TC003"]
+# ARG001/ARG002 覆盖「参数只为满足接口签名而存在」的假实现（fixture、假 LLM 等）。
+"tests/**" = ["ARG001", "ARG002", "TC001", "TC002", "TC003"]
+
+# 面向人的命令行入口：输出本身就是给终端看的报告，不是服务日志。
+# 「禁止 print」约束的是库与 server 代码（日志要结构化、可采集），CLI 的 stdout
+# 输出正是它的产出，用 logging 反而绕。两者职责不同，故在此放行 T201。
+"scripts/**" = ["T201"]
+"src/mining_daily_agent/__main__.py" = ["T201"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -91,11 +97,12 @@ no_implicit_reexport = true
 show_error_codes = true
 
 [[tool.mypy.overrides]]
-# pydantic 的 BaseModel 构造签名是 `(**data: Any)`，因此**任何**继承 BaseModel 的
-# 类都会在类定义行触发 explicit-any。这是框架层面的必然结果，改写业务代码无法消除。
-# 这里只对模型模块放开该项，其余模块仍保持最严格；
-# 模型内部的「禁止裸 Any」由 ruff 的 ANN401 继续把关函数签名。
-module = ["mining_daily_agent.models.*"]
+# 两处都是「框架的类构造签名本身带 Any」导致的必然结果，改写业务代码无法消除：
+# - pydantic 的 BaseModel 构造签名是 `(**data: Any)`；
+# - TypedDict 的构造签名同理（agent.state.BriefState 会在类定义行触发）。
+# 只对这两处放开该项，其余模块仍保持最严格；模块内部的「禁止裸 Any」由 ruff 的
+# ANN401 继续把关函数签名。
+module = ["mining_daily_agent.models.*", "mining_daily_agent.agent.state"]
 disallow_any_explicit = false
 
 [[tool.mypy.overrides]]
