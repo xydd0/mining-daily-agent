@@ -415,17 +415,14 @@ def _price_highlight(trend: TrendSeries) -> str:
     return "；".join(parts) + f"（{len(trend.points)} 个交易日）"
 
 
-#: 逐条求和超过报告自报合计多少倍即判定为「重复计入」。
-DOUBLE_COUNT_RATIO: Final = 1.2
-
-
 def _resource_highlights(report: ResourceReport) -> tuple[list[str], list[str]]:
     """按类别汇总吨位，并与报告自报合计做交叉核对。
 
-    JORC 资源表同时列出**各分块小计**与**全矿总计**（Pilgangoora 的 In-situ 349 +
-    Stockpiles 8 + 总计 356 是同一份资源量的三种口径）。既然解析器按类别逐行抽，
-    直接相加就会把同一份资源量算两遍——实测一份真实年报把 356 Mt 的 Indicated
-    加成 760 Mt。报告自报合计比求和还小时，以自报为准。
+    JORC 资源表同时列出**各分块小计**与**全矿总计**（Pilgangoora 的 In-situ 436 +
+    Stockpiles 9 与全矿总计 445 是同一份资源量的三种口径）。解析器已按分块去重，
+    这里再核一次：偏差超过 `ResourceReport.reconciliation` 里的容差（±5%）就说明
+    解析口径仍然不对，此时以**报告自报合计**为准并留下提示——一个可疑的求和值
+    不该冒充事实出现在简报里。
 
     Returns:
         ``(高亮行, 风险提示行)``。
@@ -434,15 +431,21 @@ def _resource_highlights(report: ResourceReport) -> tuple[list[str], list[str]]:
     for item in report.resources:
         totals[item.category] = totals.get(item.category, 0.0) + item.tonnage_t
 
-    overall = sum(totals.values())
-    self_reported = report.self_reported_total_t
-    if self_reported is not None and overall > self_reported * DOUBLE_COUNT_RATIO:
+    reconciliation = report.reconciliation
+    if reconciliation is not None and reconciliation.used_self_reported:
         note = (
-            f"资源量按类别逐行求和得 {overall / 1e6:.1f} Mt，超过报告自报合计 "
-            f"{self_reported / 1e6:.1f} Mt——同一份资源量在分块小计与总计里被重复计入，"
+            f"资源量按类别逐行求和得 {reconciliation.parsed_total_t / 1e6:.1f} Mt，"
+            f"与报告自报合计 {reconciliation.self_reported_total_t / 1e6:.1f} Mt 相差 "
+            f"{reconciliation.difference_ratio:+.1%}"
+            f"（超过 ±{reconciliation.tolerance:.0%} 容差）——求和值不可信"
+            "（常见于同一份资源量被重复计入，或多张不同项目的资源表被加在了一起），"
             "已以报告自报合计为准。"
         )
-        return [f"{report.project_name} 自报资源量合计 {self_reported / 1e6:.1f} Mt"], [note]
+        headline = (
+            f"{report.project_name} 自报资源量合计 "
+            f"{reconciliation.self_reported_total_t / 1e6:.1f} Mt"
+        )
+        return [headline], [note]
 
     highlights: list[str] = []
     for category in (ResourceCategory.INDICATED, ResourceCategory.INFERRED):

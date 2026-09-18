@@ -7,9 +7,12 @@
 # 刻意不使用 `from __future__ import annotations`：pydantic 需要在运行时求值注解。
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+#: 解析合计与报告自报合计的容许偏差。超出即认为解析口径不对，须改用自报合计。
+RECONCILIATION_TOLERANCE: Final = 0.05
 
 
 class ResourceCategory(StrEnum):
@@ -53,6 +56,36 @@ class ResourceItem(BaseModel):
         return self
 
 
+class ResourceReconciliation(BaseModel):
+    """解析合计与报告自报合计的核对结果。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    parsed_total_t: float = Field(description="Sum of `resources`, in tonnes.")
+    self_reported_total_t: float = Field(
+        description="Total the report states for itself, in tonnes."
+    )
+    difference_t: float = Field(
+        description=(
+            "parsed_total_t - self_reported_total_t, in tonnes. A large positive value "
+            "means the parse over-counts (typically the same resource added up twice); "
+            "a negative one means it under-counts (rows were dropped)."
+        )
+    )
+    difference_ratio: float = Field(
+        description="difference_t / self_reported_total_t, signed relative deviation."
+    )
+    tolerance: float = Field(
+        description="Relative deviation above which `used_self_reported` turns true."
+    )
+    used_self_reported: bool = Field(
+        description=(
+            "True when the deviation exceeds `tolerance`, i.e. |difference_ratio| > tolerance. "
+            "Then the parsed sum is NOT trustworthy: quote the self-reported total instead."
+        )
+    )
+
+
 class ResourceReport(BaseModel):
     """一份 PDF 资源报告的结构化抽取结果。"""
 
@@ -88,3 +121,38 @@ class ResourceReport(BaseModel):
             "counts. Null when the report has no recognisable total row."
         ),
     )
+    reconciliation: ResourceReconciliation | None = Field(
+        default=None,
+        description=(
+            "Cross-check between the sum of `resources` and `self_reported_total_t`. "
+            "Null when the report states no total. When `used_self_reported` is true, "
+            "quote `self_reported_total_t` instead of the sum and say why."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _recompute_reconciliation(self) -> Self:
+        """核对差额由当前 ``resources`` 重算，不接受外部传入。
+
+        刻意不做成可自由填写的字段：差额一旦存下来就会随 ``resources`` 变化而过期，
+        改一行数据就悄悄失真。校验器每次重建它，读到的必然与数据自洽。
+        """
+        if self.self_reported_total_t is None:
+            return self
+        parsed = sum(item.tonnage_t for item in self.resources)
+        stated = self.self_reported_total_t
+        difference = parsed - stated
+        ratio = difference / stated if stated else 0.0
+        object.__setattr__(
+            self,
+            "reconciliation",
+            ResourceReconciliation(
+                parsed_total_t=parsed,
+                self_reported_total_t=stated,
+                difference_t=difference,
+                difference_ratio=ratio,
+                tolerance=RECONCILIATION_TOLERANCE,
+                used_self_reported=abs(ratio) > RECONCILIATION_TOLERANCE,
+            ),
+        )
+        return self

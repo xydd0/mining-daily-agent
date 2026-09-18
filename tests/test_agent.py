@@ -690,6 +690,45 @@ async def test_analyze_keeps_per_category_totals_when_they_agree() -> None:
     assert result["risk_notes"] == []
 
 
+async def test_analyze_tolerates_a_difference_within_five_percent() -> None:
+    """±5% 是容差分界线：容差内的偏差不该被当成重复计入。
+
+    JORC 表逐行四舍五入到 0.1 Mt，求和与自报合计差几个百分点是常态。为此把整张表
+    判为不可信、只报一个总数，反而丢掉了分类别信息。
+    """
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 400e6  # 求和 389 Mt，偏差 -2.8%
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload)
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("Indicated 合计 300.0 Mt" in item for item in highlights), "容差内仍给分类别数字"
+    assert result["risk_notes"] == []
+
+
+async def test_analyze_falls_back_to_the_reported_total_beyond_the_tolerance() -> None:
+    """一旦越过 ±5%，求和值不再可信，改报自报合计并说明原因。"""
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 360e6  # 求和 389 Mt，偏差 +8.1%
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload)
+
+    result = await analyze(state)
+
+    highlights = result["highlights"]
+    assert isinstance(highlights, list)
+    assert any("自报资源量合计 360.0 Mt" in item for item in highlights)
+    assert not any("389" in item for item in highlights), "可疑的求和值不该被高亮出去"
+    notes = result["risk_notes"]
+    assert isinstance(notes, list)
+    assert any("重复计入" in note and "+8.1%" in note for note in notes), (
+        f"提示里要写明偏差与容差，实得 {notes}"
+    )
+
+
 async def test_analyze_flags_risk_keywords_in_headlines() -> None:
     state = initial_state(TOPIC)
     state["news"] = [
