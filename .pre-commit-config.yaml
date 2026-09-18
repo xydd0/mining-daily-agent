@@ -1,0 +1,27 @@
+# 使用 language: system + `uv run`，让钩子直接复用项目自身的 uv 环境。
+# 若改用单独的 hook 仓库，mypy 会在一个看不到项目依赖的隔离环境里运行，
+# 导致第三方包全部报 unresolved import（见 CLAUDE.md「提交规范」）。
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --force-exclude --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: mypy
+        name: mypy
+        entry: uv run mypy src
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+        require_serial: true

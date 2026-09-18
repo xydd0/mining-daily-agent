@@ -1,0 +1,29 @@
+# 密钥与本地环境配置（务必保留，勿提交）
+.env
+.env.local
+.env.*.local
+
+# 虚拟环境
+.venv/
+venv/
+
+# Python 构建产物与缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 编辑器与操作系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
