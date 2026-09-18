@@ -1,0 +1,4 @@
+# shell 脚本必须用 LF 入库且检出时不转换。
+# Windows 上 core.autocrlf 会把脚本检出成 CRLF，bash 会把行尾的 \r 当成命令的一部分，
+# 报出 `$'\r': command not found` 之类的错误；CI 跑在 Linux 上，混入 \r 同样会失败。
+*.sh text eol=lf

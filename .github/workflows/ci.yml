@@ -1,4 +1,5 @@
-# 四项门禁与 CLAUDE.md「提交规范」完全一致，顺序也保持一致，便于本地复现。
+# 与本地完全同一套门禁：本地跑 `bash scripts/gate.sh`，这里也跑它。
+# 命令的单一事实来源在 scripts/gate.sh，本文件不重复列出 ruff/mypy/pytest。
 #
 # 测试全部 mock 了网络与 LLM（见 CLAUDE.md「测试」），因此这里不需要任何密钥，
 # 也不需要联网访问外部数据源。
@@ -25,14 +26,5 @@ jobs:
       - name: 同步依赖
         run: uv sync --locked
 
-      - name: ruff check
-        run: uv run ruff check .
-
-      - name: ruff format --check
-        run: uv run ruff format --check
-
-      - name: mypy
-        run: uv run mypy
-
-      - name: pytest
-        run: uv run pytest
+      - name: 质量门禁
+        run: bash scripts/gate.sh

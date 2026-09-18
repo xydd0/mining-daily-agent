@@ -170,18 +170,23 @@ src/mining_daily_agent/
 - **每次提交前必须依次通过以下四项，全绿才允许提交**：
 
 ```bash
-uv run ruff check .
-uv run ruff format --check
-uv run mypy
-uv run pytest
+bash scripts/gate.sh
 ```
 
-同一套命令也写在 `.pre-commit-config.yaml` 与 `.github/workflows/ci.yml` 里，三处需保持一致。
+**`scripts/gate.sh` 是门禁命令的唯一来源**，它依次跑四项：`ruff check .` →
+`ruff format --check` → `mypy` → `pytest`。CLAUDE.md、`.pre-commit-config.yaml` 与
+`.github/workflows/ci.yml` 都只调这个脚本，**不要在任何地方重复列出具体命令**——
+此前三处各写一份，改一处漏一处就会「本地过了但 CI 挂了」。
 
-两处命令都改过，原因都是「看起来过了，其实没查」：
+脚本刻意不加 `set -e`：四项都跑完再汇总，一次看到全部问题。任一项失败则以非零码退出。
 
-- `ruff format --check` 是后补的。原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。
-- `mypy` 由 `mypy src` 放宽而来。带 `src` 参数会**覆盖 `pyproject.toml` 的 `files` 列表**，只检查 src；`tests/` 与 `scripts/` 的类型错误因此长期无人发现（实跑裸 `mypy` 才暴露两处）。
+其中两项是补上来的，原因都是「看起来过了，其实没查」：
+
+- `ruff format --check`：原先三项**不覆盖格式**——`ruff check` 只管 lint，不看排版。曾因此把未格式化的代码提交进 `main`，事后才用 `style(news):` 补修。
+- `mypy` 由 `mypy src` 放宽而来：带 `src` 参数会**覆盖 `pyproject.toml` 的 `files` 列表**，只检查 src；`tests/` 与 `scripts/` 的类型错误因此长期无人发现（实跑裸 `mypy` 才暴露两处）。
+
+注意门禁是**只检查、不修改**的：提交被拦下时自己跑 `uv run ruff format` 与
+`uv run ruff check --fix .` 修好再提交（早先 pre-commit 的自动修复钩子已随统一而移除）。
 
 ## 常用命令
 
@@ -191,22 +196,23 @@ uv run mining-daily-agent "<主题>"   # 与 `python -m mining_daily_agent` 等�
 uv add <package>           # 新增运行时依赖
 uv add --dev <package>     # 新增开发依赖
 
-# 提交前四项门禁，必须全绿（见「提交规范」）
-uv run ruff check .
-uv run ruff format --check
-uv run mypy
-uv run pytest --cov=mining_daily_agent --cov-fail-under=70
+# 提交前门禁：四项依次跑完并汇总，全绿才算过（见「提交规范」）
+bash scripts/gate.sh
 
 # 跑单个测试/单个文件：必须带 --no-cov，否则全局覆盖率门槛必然不达标而报错
 uv run pytest tests/test_pdf_extract.py -v --no-cov
 uv run pytest tests/test_pdf_extract.py::test_name -v --no-cov
 
-uv run ruff format         # 格式化
+uv run ruff format         # 格式化（门禁只检查不修改，被拦下时自己跑）
+uv run ruff check --fix .  # 自动修可修的 lint 问题
 ```
 
 `ruff` / `mypy` / `pytest` 的配置都在 `pyproject.toml`。其中 ruff 的 `ignore` **刻意关闭了 `RUF001`/`RUF002`/`RUF003`**——它们会把中文全角标点判为「易混淆字符」，对本项目纯属误报，不要重新开启。
 
-`.pre-commit-config.yaml` 用的是 `language: system` + `uv run` 的本地钩子：复用项目自身的 uv 环境，避免 mypy 在隔离环境里看不到依赖而全量报 unresolved import。注意 **`--all-files` 在仓库还没有 commit 时会跳过全部钩子**（`git ls-files` 为空，显示 "no files to check"），要验证钩子得显式传路径：`uv run pre-commit run --files <路径...>`。
+`.pre-commit-config.yaml` 只有一个钩子，就是调 `bash scripts/gate.sh`；用 `language: system` 复用项目自身的 uv 环境（若改用单独的 hook 仓库，mypy 会在看不到依赖的隔离环境里全量报 unresolved import）。注意两点：
+
+- **`--all-files` 在仓库还没有 commit 时会跳过全部钩子**（`git ls-files` 为空，显示 "no files to check"），要验证钩子得显式传路径：`uv run pre-commit run --files <路径...>`。
+- 钩子带 `types_or: [python, pyi]`，**只改到 Python 文件时才跑**——门禁含 pytest（约 10 秒），纯文档提交不必付这个代价。
 
 ## 环境变量契约
 
@@ -243,5 +249,5 @@ uv run ruff format         # 格式化
 
 1. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
    `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
-2. **门禁三处（CLAUDE.md / pre-commit / CI）需要手工保持一致**。改了一处忘了另一处，
-   「本地过了但 CI 挂了」就会重演。三者都是明文命令，没有单一事实来源。
+2. **门禁脚本只检查、不修改**。早先 pre-commit 的 `ruff --fix` / `ruff format` 钩子会
+   顺手改文件，统一后没有了；提交被拦下需要手工跑一次格式化。
