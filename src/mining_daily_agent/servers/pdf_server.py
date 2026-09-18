@@ -19,6 +19,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from mining_daily_agent.models.resources import ResourceReport
+from mining_daily_agent.providers import net
 from mining_daily_agent.providers.pdf import get_pdf_provider
 from mining_daily_agent.providers.pdf.mock import MockPdfProvider
 
@@ -42,7 +43,10 @@ class InvalidPdfUrlError(ValueError, ToolError):
 
 
 def _validate_url(url: str) -> str:
-    """校验 URL 是绝对 http(s) 地址。
+    """校验 URL 是绝对 http(s) 地址，且不通向本机 / 私网 / 云元数据地址。
+
+    地址来自检索结果，是完全不可信的外部输入——一个被牵着走的 URL 就能读到内网服务。
+    DNS 解析那道检查放在下载路径（``net.get_capped``），入参校验不做网络调用。
 
     Raises:
         InvalidPdfUrlError: URL 非法（同时是 ValueError 与 ToolError）。
@@ -55,6 +59,10 @@ def _validate_url(url: str) -> str:
             "https://example.com/mineral-resource-report.pdf。"
         )
         raise InvalidPdfUrlError(msg)
+    try:
+        net.ensure_public_url(url)
+    except net.UnsafeUrlError as exc:
+        raise InvalidPdfUrlError(f"拒绝访问该 PDF URL：{exc}") from exc
     return url
 
 

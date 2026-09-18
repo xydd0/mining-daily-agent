@@ -62,6 +62,10 @@ uv run python scripts/verify_pool.py
 - 采用 **src 布局**：代码放 `src/mining_daily_agent/`，`uv_build` 要求保持该结构。子包划分见「代码组织」。
 - 入口点：`mining_daily_agent.__main__:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
   **只有这一个** CLI 实现；改动它时 `tests/test_entrypoint.py` 会校验脚本目标没有分叉。
+- **`main()` 第一件事是把 stdout/stderr 切到 UTF-8**（`force_utf8_stdio()`）。Windows 中文
+  控制台默认 GBK，而简报正文里有从报告原文照抄的 U+2011（`In‑situ`）、U+2019
+  （`Fog’s Block`）——GBK 编不出，`print` 抛 `UnicodeEncodeError`：**文件已落盘、退出码
+  却是非 0**，Windows 上会被当成运行失败。新增终端输出时不要绕过这一步。
 - `pydantic` 已显式声明进 `dependencies`（此前只靠 `mcp` 传递依赖，属隐患）。
 
 ## 代码组织
@@ -98,6 +102,16 @@ src/mining_daily_agent/
 - 必须实现**指数退避重试，最多 3 次**。
 - **所有数据源必须同时提供 mock 实现作为降级兜底**：真实源失败时自动回退到 mock 实现，**不得抛异常中断整体流程**。
 - 降级不能静默发生，必须按「日志」规范记录。
+- **外发请求一律走 `providers/net.py`**（`get_capped`）：它做 SSRF 拦截（回环 / 私网 /
+  链路本地含 `169.254.169.254` / IPv4-mapped IPv6）、**逐跳**校验重定向，并按上限流式
+  读取（PDF 50 MB、HTML 5 MB）。**别用 `follow_redirects=True`**——那样中途跳内网拦不住；
+  新数据源也不要绕过它直接 `httpx.get`。已知局限：校验与连接之间有 DNS rebinding 窗口。
+- **连接池的启动握手有 30 秒上限**（`STARTUP_TIMEOUT_SECONDS`）：卡死的 server 会被判为
+  失败并取消，其余照常连上。没有它，`_connect_all` 的 gather 会永远等下去，
+  「单个失败不阻塞整体」就成了空话。
+- **价格的降级标记是 `PricePoint.degraded`**（mock 一律 True，`TrendSeries` 由校验器继承）。
+  简报的**价格小节与风险提示都要**出现「合成数据，非真实行情」——只写在风险提示里不够，
+  读者先看到的是价格那一行数字。
 
 ## 日志
 

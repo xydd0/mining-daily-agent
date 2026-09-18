@@ -50,6 +50,8 @@ YAHOO_URL_TEMPLATE: Final = "https://query1.finance.yahoo.com/v8/finance/chart/{
 
 #: Yahoo 上回看几天的日线；90 个交易日需要留出余量，取 6 个月。
 YAHOO_RANGE: Final = "6mo"
+#: Yahoo 的采样间隔。必须是 ``1d``——不传它拿到的是当日盘中点，见 ``_fetch_from_yahoo``。
+YAHOO_DAY_INTERVAL: Final = "1d"
 
 
 class PriceFetchError(RuntimeError):
@@ -126,16 +128,29 @@ def source_label(source_name: str, symbol: str, proxy: ProxySymbol) -> str:
     )
 
 
-def _http_get(url: str, headers: Mapping[str, str] | None = None) -> httpx.Response:
+def _http_get(
+    url: str,
+    headers: Mapping[str, str] | None = None,
+    params: Mapping[str, str] | None = None,
+) -> httpx.Response:
     """发出单次 GET。
 
     这是本模块唯一的 HTTP 接缝：超时在此统一设置，测试也在这里替换。
     """
-    return httpx.get(url, timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True, headers=headers)
+    return httpx.get(
+        url,
+        timeout=HTTP_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        headers=headers,
+        params=params,
+    )
 
 
 def _get_response(
-    url: str, source_name: str, headers: Mapping[str, str] | None = None
+    url: str,
+    source_name: str,
+    headers: Mapping[str, str] | None = None,
+    params: Mapping[str, str] | None = None,
 ) -> httpx.Response:
     """带超时与指数退避重试的 GET。
 
@@ -145,7 +160,7 @@ def _get_response(
     last_error: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = _http_get(url, headers)
+            response = _http_get(url, headers, params)
             response.raise_for_status()
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             last_error = exc
@@ -261,12 +276,18 @@ def _fetch_from_stooq(proxy: ProxySymbol) -> list[tuple[date, float]]:
 
 
 def _fetch_from_yahoo(proxy: ProxySymbol) -> list[tuple[date, float]]:
-    """从 Yahoo Finance 取日线。"""
+    """从 Yahoo Finance 取**日线**。
+
+    ``range`` 与 ``interval`` 必须显式带上：不带时 Yahoo 返回的是**当日盘中**的密集
+    采样（同一交易日几十条、时间戳几乎相同），``get_trend`` 于是把一天画成锯齿，
+    ``change_pct`` 也随之失真——涨跌幅算的是「开盘到此刻」而不是「区间首末」。
+    """
     url = YAHOO_URL_TEMPLATE.format(symbol=proxy.yahoo)
     response = _get_response(
         url,
         source_name="Yahoo Finance",
         headers={"User-Agent": BROWSER_USER_AGENT, "Accept": "application/json"},
+        params={"range": YAHOO_RANGE, "interval": YAHOO_DAY_INTERVAL},
     )
     return parse_yahoo_chart(response.json())
 

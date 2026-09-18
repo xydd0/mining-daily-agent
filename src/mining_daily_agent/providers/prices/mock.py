@@ -103,6 +103,7 @@ def build_mock_series(commodity: str, today: date | None = None) -> list[PricePo
                 currency="USD",
                 unit=MOCK_UNIT,
                 source=MOCK_SOURCE,
+                degraded=True,
             )
         )
     return points

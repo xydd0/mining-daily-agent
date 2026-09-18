@@ -20,6 +20,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from mining_daily_agent.models.news import Article, NewsItem
+from mining_daily_agent.providers import net
 from mining_daily_agent.providers.news import get_news_provider
 from mining_daily_agent.providers.news.mock import MockNewsProvider
 
@@ -54,7 +55,10 @@ class InvalidArticleUrlError(ValueError, ToolError):
 
 
 def _validate_url(url: str) -> str:
-    """校验 URL 是绝对 http(s) 地址。
+    """校验 URL 是绝对 http(s) 地址，且不通向本机 / 私网 / 云元数据地址。
+
+    文章 URL 直接来自检索结果，是完全不可信的外部输入。DNS 解析那道检查放在下载
+    路径（``net.get_capped``），入参校验不做网络调用。
 
     Raises:
         InvalidArticleUrlError: URL 非法（同时是 ValueError 与 ToolError）。
@@ -66,6 +70,10 @@ def _validate_url(url: str) -> str:
             "需要一个绝对的 http(s) 地址，例如 https://www.mining.com/some-article/。"
         )
         raise InvalidArticleUrlError(msg)
+    try:
+        net.ensure_public_url(url)
+    except net.UnsafeUrlError as exc:
+        raise InvalidArticleUrlError(f"拒绝访问该文章 URL：{exc}") from exc
     return url
 
 

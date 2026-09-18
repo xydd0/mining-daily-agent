@@ -207,6 +207,28 @@ def test_fetch_article_does_not_touch_provider_for_invalid_url(
     with pytest.raises(ValueError, match="URL"):
         news_server.fetch_article(url="example.com/article")
 
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "http://127.0.0.1:8080/admin",
+        "http://192.168.1.1/router",
+        "http://localhost/admin",
+    ],
+)
+def test_private_article_urls_are_rejected(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """文章 URL 来自检索结果，是不可信输入——一个被牵着走的地址就能读到内网。
+
+    这里断言的是**被拒**（抛出 ToolError），不是静默降级成 mock：探测内网这件事
+    不该被伪装成「数据源不可用」。
+    """
+    provider = _RecordingProvider()
+    monkeypatch.setattr(news_server, "get_news_provider", lambda: provider)
+
+    with pytest.raises(ToolError, match="拒绝访问"):
+        news_server.fetch_article(url=url)
+
     assert provider.article_calls == []
 
 

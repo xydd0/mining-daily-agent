@@ -10,11 +10,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NoReturn, Protocol
+from typing import TYPE_CHECKING, Final, NoReturn, Protocol
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -30,6 +31,11 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
+
+
+#: 单个 server 的**启动握手**超时秒数。握手远快于工具调用（后者默认 120 秒），
+#: 30 秒还没连上基本可以断定它卡住了；超过即把它判为失败，不拖住其余 server。
+STARTUP_TIMEOUT_SECONDS: Final = 30.0
 
 
 class McpPoolError(RuntimeError):
@@ -139,9 +145,39 @@ class _ServerWorker:
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        """启动工作协程，并等它把连接结果定下来。"""
+        """启动工作协程，并**限时**等它把连接结果定下来。
+
+        没有这个上限时，一个卡住的 server（进程起来了但不回 MCP 握手）会让
+        ``_connect_all`` 的 gather 永远等下去——「单个失败不阻塞整体」就成了空话。
+        """
         self._task = asyncio.create_task(self._run())
-        await self._ready.wait()
+        try:
+            async with asyncio.timeout(STARTUP_TIMEOUT_SECONDS):
+                await self._ready.wait()
+        except TimeoutError:
+            self.failure = f"启动握手超时（超过 {STARTUP_TIMEOUT_SECONDS:g} 秒未完成）"
+            logger.warning(
+                "MCP server 启动超时，跳过：server=%s command=%s args=%s timeout_s=%g",
+                self.spec.name,
+                self.spec.command,
+                list(self.spec.args),
+                STARTUP_TIMEOUT_SECONDS,
+            )
+            await self._abandon()
+
+    async def _abandon(self) -> None:
+        """放弃这个 server：取消后台任务、等它收尾，再把引用清干净。
+
+        ``self._task`` 置空是有意的——``stop()`` 随后会直接返回，而 await 一个已取消
+        的任务会抛 ``CancelledError``，那不是 ``stop()`` 该处理的异常。
+        """
+        self.session = None
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     async def stop(self) -> None:
         """发出停止信号并等任务收尾。"""

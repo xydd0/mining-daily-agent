@@ -14,10 +14,16 @@ from email.utils import format_datetime
 import httpx
 import pytest
 
+from mining_daily_agent.models.news import NewsItem
+from mining_daily_agent.providers import net
 from mining_daily_agent.providers.news import mock as mock_module
 from mining_daily_agent.providers.news import rss
 from mining_daily_agent.providers.news.mock import MockNewsProvider
-from mining_daily_agent.providers.news.rss import RssFetchError, RssNewsProvider, clean_summary
+from mining_daily_agent.providers.news.rss import (
+    RssFetchError,
+    RssNewsProvider,
+    clean_summary,
+)
 
 FEED_URL = "https://example.com/feed"
 
@@ -119,18 +125,20 @@ def test_fetch_bytes_retries_on_http_error_status(monkeypatch: pytest.MonkeyPatc
         rss._fetch_bytes(FEED_URL)
 
 
-def test_http_get_sets_explicit_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_http_get_sets_explicit_timeout_and_size_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """超时与大小上限都必须显式给，不能靠库的默认行为。"""
     seen: dict[str, object] = {}
 
     def _fake(url: str, **kwargs: object) -> httpx.Response:
         seen.update(kwargs)
         return _response(url, "<rss/>")
 
-    monkeypatch.setattr(httpx, "get", _fake)
+    monkeypatch.setattr(net, "get_capped", _fake)
 
     rss._http_get(FEED_URL)
 
     assert seen["timeout"] == rss.HTTP_TIMEOUT_SECONDS == 15.0
+    assert seen["max_bytes"] == net.HTML_MAX_BYTES
 
 
 # --- RssNewsProvider.search -------------------------------------------------
@@ -196,6 +204,48 @@ def test_search_applies_local_keyword_filter_for_feeds_without_query(
 
     with pytest.raises(RssFetchError, match="全部 RSS 源"):
         RssNewsProvider().search("pilbara lithium", days=1)
+
+
+def test_query_terms_splits_on_the_or_joiner() -> None:
+    """拼好的 "A OR B" 要按连接符切回原始关键词，不能按空白切。"""
+    assert rss.query_terms("Pilbara OR lithium") == ["Pilbara", "lithium"]
+    assert rss.query_terms("Pilbara lithium mine OR Pilgangoora") == [
+        "Pilbara lithium mine",
+        "Pilgangoora",
+    ]
+    assert rss.query_terms("Pilbara Minerals") == ["Pilbara Minerals"]
+
+
+def test_or_is_not_a_keyword() -> None:
+    """实测的坑：把 "A OR B" 按空白切开后，"or" 也成了关键词。
+
+    于是任何标题里带 "or" 的词（Exploration、Resources、Report…）都被判为命中，
+    备用源的本地过滤形同虚设。关键词是 ``["Pilbara", "lithium"]`` 时，一条只讲
+    铜矿勘探的新闻不该被放进来。
+    """
+    item = NewsItem(
+        title="Copper exploration report",
+        url="https://example.com/a",
+        source="Example",
+        published_at=datetime.now(UTC),
+        summary="Drilling results and resource estimates.",
+    )
+
+    assert not rss._matches_query(item, "Pilbara OR lithium")
+
+
+def test_local_filter_matches_any_keyword() -> None:
+    item = NewsItem(
+        title="Pilbara spodumene shipments rise",
+        url="https://example.com/a",
+        source="Example",
+        published_at=datetime.now(UTC),
+        summary="Lithium volumes up.",
+    )
+
+    assert rss._matches_query(item, "Pilbara OR lithium"), "命中第一个关键词"
+    assert rss._matches_query(item, "Greenbushes OR lithium"), "命中第二个关键词"
+    assert not rss._matches_query(item, "Greenbushes OR Wodgina"), "都没有才不命中"
 
 
 def test_search_raises_when_all_sources_fail(monkeypatch: pytest.MonkeyPatch) -> None:

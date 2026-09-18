@@ -6,7 +6,9 @@ LLM 与连接池全部替换成假实现，不触网、不起子进程；简报�
 
 from __future__ import annotations
 
+import io
 import json
+import sys
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -32,8 +34,10 @@ from mining_daily_agent.agent.llm import (
 from mining_daily_agent.agent.nodes import (
     ARTICLE_EXCERPT_CHARS,
     DEGRADED_MARK,
+    LLM_FALLBACK_NOTE,
     MIN_PLAN_DAYS,
-    NEWS_HEADLINE_MAX_CHARS,
+    NEWS_BODY_NOTE,
+    PRICE_DEGRADED_MARK,
     ToolCaller,
     analyze,
     build_citations,
@@ -928,23 +932,145 @@ async def test_irrelevant_news_is_filtered_out(monkeypatch: pytest.MonkeyPatch) 
     assert "与主题主体" in document, "剔除动作要在风险提示里留痕"
 
 
-async def test_headline_is_capped_at_the_spec_length(monkeypatch: pytest.MonkeyPatch) -> None:
-    """要点式小标题 ≤25 字——LLM 写超了由代码压，不指望它自己数。"""
+async def test_headlines_are_never_truncated_with_an_ellipsis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """小标题必须是完整短句，不能是「…」结尾的半句话。
+
+    实测出现过「Pilbara Minerals 定于11月24…」——那是代码按 25 字硬砍出来的。现在
+    代码**不再截断**：字数由提示词约束，代码只拒掉带剪裁痕迹的写法，并退回原标题兜底。
+    """
     _install_llm(
         monkeypatch,
         PLAN_REPLY,
         json.dumps(
-            {"items": [{"index": 1, "headline": "很" * 60, "lede": "导语。"}]},
+            {
+                "items": [
+                    {"index": 1, "headline": "锂价走势牵动 ASX 电池材料股", "lede": "导语一。"},
+                    {"index": 2, "headline": "Pilbara Minerals 定于11月24…", "lede": "导语二。"},
+                ]
+            },
             ensure_ascii=False,
         ),
     )
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
 
-    line = next(text for text in document.splitlines() if text.startswith("**1. "))
-    headline = line.removeprefix("**1. ").removesuffix("**")
-    assert len(headline) == NEWS_HEADLINE_MAX_CHARS == 25
-    assert headline.endswith("…")
+    headlines = [line for line in document.splitlines() if line.startswith("**")]
+    assert len(headlines) == 2
+    for line in headlines:
+        assert "…" not in line, f"小标题带了剪裁痕迹：{line}"
+        assert "..." not in line, f"小标题带了剪裁痕迹：{line}"
+    assert "锂价走势牵动 ASX 电池材料股" in document, "自拟的完整短句原样采用"
+    assert "Pilbara lithium output rises 1" in document, "被拒的那条退回原标题兜底"
+
+
+async def test_degraded_price_is_disclosed_in_both_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """合成行情要在「价格走势」与「风险提示」两节都点明。
+
+    只躺在风险提示里不够——读者先看到的是价格那一行数字。
+    """
+    payload = _trend_payload()
+    points = payload["points"]
+    assert isinstance(points, list)
+    for point in points:
+        assert isinstance(point, dict)
+        point["degraded"] = True
+    responses = _responses()
+    responses[("price", "get_trend")] = _ok(payload)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    price_section = document.split("## 三、价格走势")[1].split("## 四、")[0]
+    assert PRICE_DEGRADED_MARK in price_section
+    risk_section = document.split("## 四、风险提示")[1].split("## 引用源")[0]
+    assert PRICE_DEGRADED_MARK in risk_section
+
+
+async def test_real_price_is_not_marked_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert PRICE_DEGRADED_MARK not in document
+
+
+async def test_llm_failure_falls_back_to_a_deterministic_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 整个挂掉时简报照出，并注明数据直出。
+
+    兑现 README 的「没有 LLM 也能出简报」：结构与小节完整，只是新闻导语退回原标题与摘要。
+    """
+
+    class _BrokenLLM:
+        async def ainvoke(self, input: str) -> BaseMessage:  # noqa: A002 — 与 SDK 同名
+            msg = "upstream 503"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(nodes_module, "build_llm", _BrokenLLM)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    for section in (
+        "## 一、新闻摘要",
+        "## 二、储量数据",
+        "## 三、价格走势",
+        "## 四、风险提示",
+        "## 引用源",
+    ):
+        assert section in document, f"LLM 挂掉时仍要有 {section}"
+    assert "LLM 合成失败，以下为数据直出" in document
+    assert "Pilbara lithium output rises 0" in document, "新闻退回原标题"
+
+
+async def test_a_missing_section_triggers_one_strict_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """四节契约被破坏时带严格指令重试一次，仍不行就整体数据直出。
+
+    正常路径下四节全由代码渲染，这一步不会触发——它是一道回归护栏：改 `SECTION_*`
+    或渲染分支时漏掉一节会被当场抓住，而不是让读者拿到半份简报。
+    """
+    llm = _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY, LEDES_REPLY)
+    monkeypatch.setattr(nodes_module, "_render_price", lambda _state: "")
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert len(llm.prompts) == 3, "planner + 首次 + 严格重试，一共三次"
+    assert "只输出那个 JSON 对象本身" in llm.prompts[-1], "重试必须带严格指令"
+    assert LLM_FALLBACK_NOTE in document, "重试后仍缺节 → 数据直出"
+    assert "## 一、新闻摘要" in document, "其余小节照常"
+
+
+async def test_news_body_note_is_printed_once_at_the_section_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """「正文未抓取」只在新闻小节末尾说一次，不在各条导语里逐条重复。"""
+    responses = _responses()
+    responses[("news", "fetch_article")] = _ok(_article_payload(text=""))  # 抓回空正文
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    assert document.count(NEWS_BODY_NOTE) == 1, "统一注释只出现一次"
+    news_section = document.split("## 二、储量数据")[0]
+    assert NEWS_BODY_NOTE in news_section, "注释应落在新闻摘要小节里"
+    assert "抓回的正文为空" in document, "风险提示中对应条目保留，不改"
+
+
+async def test_no_body_note_when_the_article_was_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正文抓到了就不该出现这句注释——它描述的是没抓到的情况。"""
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert NEWS_BODY_NOTE not in document
 
 
 async def test_news_falls_back_to_title_and_summary_when_the_llm_gives_nothing(
@@ -1131,6 +1257,32 @@ def test_cli_prints_the_brief(
     assert code == 0
     assert captured == ["Pilbara 锂矿"]
     assert "# 简报正文" in capsys.readouterr().out
+
+
+def test_cli_survives_a_gbk_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows 中文控制台默认 GBK，而简报里有 GBK 编不出的字符。
+
+    U+2011（``In‑situ``）、U+2019（``Fog’s Block``）直接来自资源报告原文，GBK 码表里
+    没有。不切 UTF-8 的话 ``print`` 抛 ``UnicodeEncodeError``：**文件已经落盘、退出码
+    却是非 0**，Windows 上的评审者会当成运行失败。
+    """
+
+    async def _fake(topic: str, pool: ToolCaller | None = None) -> str:
+        return "# 矿权日报 · Pilbara 锂矿\n- In‑situ、Fog’s Block\n"
+
+    buffer = io.BytesIO()
+    gbk_console = io.TextIOWrapper(buffer, encoding="gbk", errors="strict", newline="")
+    monkeypatch.setattr(cli_module, "run_daily_brief", _fake)
+    monkeypatch.setattr(sys, "stdout", gbk_console)
+    monkeypatch.setattr(sys, "stderr", gbk_console)
+
+    code = cli_module.main([])
+
+    gbk_console.flush()
+    assert code == 0, "打印不该让整条流程以非 0 退出"
+    text = buffer.getvalue().decode("utf-8")
+    assert "In‑situ" in text, "切到 UTF-8 后原样写出，不打折"
+    assert "Pilbara 锂矿" in text
 
 
 def test_cli_defaults_to_the_default_topic() -> None:

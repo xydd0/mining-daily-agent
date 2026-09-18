@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import logging
 import sys
 
@@ -20,6 +21,24 @@ from mining_daily_agent.agent import run_daily_brief
 
 #: 不传 topic 时的默认主题。
 DEFAULT_TOPIC = "Pilbara 锂矿"
+
+
+def force_utf8_stdio() -> None:
+    """把 stdout / stderr 切到 UTF-8，保证任何终端编码下打印都不会崩。
+
+    Windows 中文控制台默认 **GBK**，而简报正文里带着资源报告原文照抄下来的字符——
+    U+2011（非断行连字符，``In‑situ``）、U+2019（右单引号，``Fog’s Block``）、
+    以及各种破折号。GBK 码表里没有 U+2011，``print`` 会抛 ``UnicodeEncodeError``：
+    **文件已经落盘、退出码却是非 0**，Windows 上的评审者会直接当成运行失败。
+
+    ``errors="replace"`` 是第二道保险：万一某台机器的控制台连 UTF-8 都写不出去
+    （比如被重定向到只认 ASCII 的管道），也只是把个别字符打成 ``?``，不会让整条流程失败。
+
+    只处理 ``io.TextIOWrapper``：pytest 的捕获对象等替身不是它，不该被这里改写。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """解析参数、跑流程、把简报打到终端。"""
+    # 放在最前面：logging 也可能往 stderr 写非 GBK 字符，日志必须和正文一样安全。
+    force_utf8_stdio()
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
