@@ -34,8 +34,10 @@ from mining_daily_agent.agent.llm import (
 from mining_daily_agent.agent.nodes import (
     ARTICLE_EXCERPT_CHARS,
     DEGRADED_MARK,
+    LLM_FALLBACK_NOTE,
     MIN_PLAN_DAYS,
     NEWS_BODY_NOTE,
+    PRICE_DEGRADED_MARK,
     ToolCaller,
     analyze,
     build_citations,
@@ -961,6 +963,87 @@ async def test_headlines_are_never_truncated_with_an_ellipsis(
         assert "..." not in line, f"小标题带了剪裁痕迹：{line}"
     assert "锂价走势牵动 ASX 电池材料股" in document, "自拟的完整短句原样采用"
     assert "Pilbara lithium output rises 1" in document, "被拒的那条退回原标题兜底"
+
+
+async def test_degraded_price_is_disclosed_in_both_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """合成行情要在「价格走势」与「风险提示」两节都点明。
+
+    只躺在风险提示里不够——读者先看到的是价格那一行数字。
+    """
+    payload = _trend_payload()
+    points = payload["points"]
+    assert isinstance(points, list)
+    for point in points:
+        assert isinstance(point, dict)
+        point["degraded"] = True
+    responses = _responses()
+    responses[("price", "get_trend")] = _ok(payload)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    price_section = document.split("## 三、价格走势")[1].split("## 四、")[0]
+    assert PRICE_DEGRADED_MARK in price_section
+    risk_section = document.split("## 四、风险提示")[1].split("## 引用源")[0]
+    assert PRICE_DEGRADED_MARK in risk_section
+
+
+async def test_real_price_is_not_marked_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert PRICE_DEGRADED_MARK not in document
+
+
+async def test_llm_failure_falls_back_to_a_deterministic_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 整个挂掉时简报照出，并注明数据直出。
+
+    兑现 README 的「没有 LLM 也能出简报」：结构与小节完整，只是新闻导语退回原标题与摘要。
+    """
+
+    class _BrokenLLM:
+        async def ainvoke(self, input: str) -> BaseMessage:  # noqa: A002 — 与 SDK 同名
+            msg = "upstream 503"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(nodes_module, "build_llm", _BrokenLLM)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    for section in (
+        "## 一、新闻摘要",
+        "## 二、储量数据",
+        "## 三、价格走势",
+        "## 四、风险提示",
+        "## 引用源",
+    ):
+        assert section in document, f"LLM 挂掉时仍要有 {section}"
+    assert "LLM 合成失败，以下为数据直出" in document
+    assert "Pilbara lithium output rises 0" in document, "新闻退回原标题"
+
+
+async def test_a_missing_section_triggers_one_strict_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """四节契约被破坏时带严格指令重试一次，仍不行就整体数据直出。
+
+    正常路径下四节全由代码渲染，这一步不会触发——它是一道回归护栏：改 `SECTION_*`
+    或渲染分支时漏掉一节会被当场抓住，而不是让读者拿到半份简报。
+    """
+    llm = _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY, LEDES_REPLY)
+    monkeypatch.setattr(nodes_module, "_render_price", lambda _state: "")
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert len(llm.prompts) == 3, "planner + 首次 + 严格重试，一共三次"
+    assert "只输出那个 JSON 对象本身" in llm.prompts[-1], "重试必须带严格指令"
+    assert LLM_FALLBACK_NOTE in document, "重试后仍缺节 → 数据直出"
+    assert "## 一、新闻摘要" in document, "其余小节照常"
 
 
 async def test_news_body_note_is_printed_once_at_the_section_end(

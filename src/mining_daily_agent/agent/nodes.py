@@ -177,6 +177,9 @@ RISK_KEYWORDS: Final[tuple[str, ...]] = (
 RESOURCE_HINTS: Final = ("resource", "reserve", "mineral", "feasibility", "report")
 #: 来源里给降级数据加的后缀，提醒读者这不是真实数据。
 DEGRADED_MARK: Final = "【降级示例数据】"
+#: 合成行情的显式标注。价格小节与风险提示都要出现这句原话——降级链路的诚实性
+#: 最终就体现在这里：读者必须一眼看出这不是市场行情。
+PRICE_DEGRADED_MARK: Final = "合成数据，非真实行情"
 #: 文件名里保留的字符：Unicode 字母数字、下划线、连字符（中文因此得以保留）。
 _SLUG_STRIP_RE: Final = re.compile(r"[^\w\-]+", re.UNICODE)
 #: 从可能带代码围栏的文本里抓第一个 JSON 对象。
@@ -203,12 +206,30 @@ SECTION_RESOURCE: Final = "## 二、储量数据"
 SECTION_PRICE: Final = "## 三、价格走势"
 SECTION_RISK: Final = "## 四、风险提示"
 SECTION_CITATIONS: Final = "## 引用源"
+#: 简报必须包含的小节——契约，缺一个都不算完整（见 `_missing_sections`）。
+REQUIRED_SECTIONS: Final[tuple[str, ...]] = (
+    SECTION_NEWS,
+    SECTION_RESOURCE,
+    SECTION_PRICE,
+    SECTION_RISK,
+)
 #: 正文没抓到时，新闻小节末尾的统一注释。
 #:
 #: 各条导语逐条写「该报道正文未能抓取」既啰嗦又抢戏，收成一句放在小节末尾说明一次。
 #: 风险提示里对应的那条保留——那是披露，与小节注释不是一回事。
 NEWS_BODY_NOTE: Final = (
     "注：本期新闻源经 Google News 中转页，正文未能抓取，各条导语基于标题与摘要撰写。"
+)
+
+#: 重试时追加的更强硬指令。上一次的输出没能让简报成篇，这一次必须只吐合规 JSON。
+_STRICT_RETRY_INSTRUCTION: Final = (
+    "上一次的输出不符合要求。这次只输出那个 JSON 对象本身：不要解释、"
+    "不要 Markdown 围栏、不要遗漏任何一条新闻，每条的 headline 与 lede 都不能为空。"
+)
+
+#: LLM 不可用时的风险提示。措辞要让读者知道：结构没丢，只是没有被语言模型润色过。
+LLM_FALLBACK_NOTE: Final = (
+    "LLM 合成失败，以下为数据直出（小节结构完整，新闻导语退回原标题与摘要）。"
 )
 
 #: LLM 在整条流水线里**只负责**新闻小节的小标题与导语——这两样确实需要理解正文。
@@ -551,6 +572,13 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
         except AgentError as exc:
             notes.append(f"价格源失败，已降级：{exc}")
 
+    if trend is not None and trend.degraded:
+        # 合成行情不加披露，简报会把随机游走当成真实报价——比报错更糟。
+        notes.append(
+            f"价格走势为{PRICE_DEGRADED_MARK}（行情源不可用，已降级为合成序列），"
+            "不得当作真实行情引用。"
+        )
+
     report: ResourceReport | None = None
     if plan.needs_pdf:
         report_url = _pick_report_url(news)
@@ -685,7 +713,8 @@ def build_citations(state: BriefState) -> list[str]:
         citations.append(f"{report.project_name} 资源量报告 — {report.source_url}{mark}")
     trend = state["price_trend"]
     if trend is not None:
-        citations.append(f"{trend.commodity} 价格数据 — {trend.source}")
+        mark = f"（{PRICE_DEGRADED_MARK}）" if trend.degraded else ""
+        citations.append(f"{trend.commodity} 价格数据 — {trend.source}{mark}")
     return citations
 
 
@@ -803,19 +832,32 @@ def _fallback_lede(item: NewsItem) -> NewsLede:
     return NewsLede(headline=headline or item.url, lede=lede)
 
 
-async def _news_ledes(state: BriefState) -> dict[int, NewsLede]:
-    """让 LLM 为每条新闻写小标题与导语；整段失败就统一退回标题 + 摘要。"""
+async def _news_ledes(
+    state: BriefState, *, strict: bool = False
+) -> tuple[dict[int, NewsLede], bool]:
+    """让 LLM 为每条新闻写小标题与导语。
+
+    Args:
+        state: 当前状态。
+        strict: 重试时置 True，在提示词末尾追加一条更强硬的指令。
+
+    Returns:
+        ``(导语表, LLM 是否失败)``。**这里不抛异常**：调用失败（鉴权、超时、5xx）
+        返回 ``({}, True)``，由调用方决定重试还是走确定性直出——简报必须出得来。
+    """
     prompt = _NEWS_PROMPT.format(
         data=_news_prompt_data(state),
         degraded_mark=DEGRADED_MARK,
         headline_max=NEWS_HEADLINE_MAX_CHARS,
     )
+    if strict:
+        prompt = f"{prompt}\n{_STRICT_RETRY_INSTRUCTION}\n"
     try:
         response = await build_llm().ainvoke(prompt)
-    except Exception as exc:  # 简报必须出得来，LLM 挂了不是中断流程的理由
-        logger.warning("新闻导语生成失败，改用标题与摘要：%s: %s", type(exc).__name__, exc)
-        return {}
-    return _parse_ledes(_message_text(response), state["news"])
+    except Exception as exc:  # LLM 挂了不是中断整条流程的理由
+        logger.warning("新闻导语生成失败：%s: %s", type(exc).__name__, exc)
+        return {}, True
+    return _parse_ledes(_message_text(response), state["news"]), False
 
 
 # --- 模板渲染 ---------------------------------------------------------------
@@ -918,11 +960,15 @@ def _render_price(state: BriefState) -> str:
         f"区间涨跌 {trend.change_pct:+.2f}%，7 日均线 {ma7}，30 日均线 {ma30}{cite}。"
     )
     # 尾注用数据源自带的说明，不自己改写：代理品种的免责声明必须原样落地。
-    return "\n\n".join([SECTION_PRICE, line, f"（{trend.source}）"])
+    tail = f"（{trend.source}）"
+    if trend.degraded:
+        # 合成序列必须在本节里就点明，不能只躺在风险提示里。
+        line += f" **{PRICE_DEGRADED_MARK}。**"
+    return "\n\n".join([SECTION_PRICE, line, tail])
 
 
-def _render_risks(state: BriefState) -> str:
-    notes = state["risk_notes"]
+def _render_risks(state: BriefState, extra_notes: list[str]) -> str:
+    notes = [*state["risk_notes"], *extra_notes]
     body = "\n".join(f"- {note}" for note in notes) if notes else "本轮无重大风险事件。"
     return f"{SECTION_RISK}\n\n{body}"
 
@@ -935,22 +981,63 @@ def _render_citations(state: BriefState) -> str:
     return f"{SECTION_CITATIONS}\n\n{body}"
 
 
-async def synthesize(state: BriefState) -> dict[str, object]:
-    """按写死的模板渲染简报正文。
-
-    LLM 只写新闻小节的小标题与导语——那两样确实需要读正文；其余小节全部由代码渲染。
-    小节名、编号对应、「矿石量」这类措辞是硬性约束，靠提示词保证不了，靠代码可以。
-    """
-    ledes = await _news_ledes(state) if state["news"] else {}
+def _assemble(state: BriefState, ledes: dict[int, NewsLede], extra_notes: list[str]) -> str:
+    """把各小节拼成完整简报。抽成函数是因为契约校验失败时要能整体重来一次。"""
     blocks = [
         _render_title(state),
         _render_news(state, ledes),
         _render_resources(state),
         _render_price(state),
-        _render_risks(state),
+        _render_risks(state, extra_notes),
         _render_citations(state),
     ]
-    return {"markdown": "\n\n".join(blocks).rstrip() + "\n"}
+    return "\n\n".join(blocks).rstrip() + "\n"
+
+
+def _missing_sections(document: str) -> list[str]:
+    """返回文档里缺失的必需小节标题。
+
+    四个小节全部由代码渲染，所以正常情况下这里永远为空——它是一道**回归护栏**：
+    改 `SECTION_*` 或渲染分支时漏掉一节，会被当场抓住，而不是让读者拿到半份简报。
+    """
+    return [section for section in REQUIRED_SECTIONS if section not in document]
+
+
+async def synthesize(state: BriefState) -> dict[str, object]:
+    """按写死的模板渲染简报正文。
+
+    LLM 只写新闻小节的小标题与导语——那两样确实需要读正文；其余小节全部由代码渲染。
+    小节名、编号对应、「矿石量」这类措辞是硬性约束，靠提示词保证不了，靠代码可以。
+
+    三道收口，缺一不可：
+
+    1. LLM 调用失败（鉴权 / 超时 / 5xx）**不中断**，新闻退回首标题 + 摘要的确定性写法；
+    2. 拼装完成后校验四节契约，缺失就带严格指令**重试一次**（只影响 LLM 那一节）；
+    3. 重试后仍不合契约，或 LLM 根本不可用，就整体走**确定性直出**，风险提示里注明。
+    """
+    ledes: dict[int, NewsLede] = {}
+    llm_failed = False
+    if state["news"]:
+        ledes, llm_failed = await _news_ledes(state)
+
+    extra_notes: list[str] = []
+    document = _assemble(state, ledes, extra_notes)
+
+    missing = _missing_sections(document)
+    if missing:
+        logger.warning("简报缺少小节 %s，带严格指令重试一次", "、".join(missing))
+        if state["news"]:
+            ledes, llm_failed = await _news_ledes(state, strict=True)
+        document = _assemble(state, ledes, extra_notes)
+        missing = _missing_sections(document)
+
+    if missing or llm_failed:
+        if missing:
+            logger.warning("重试后仍缺少小节 %s，改用确定性模板直出", "、".join(missing))
+        extra_notes = [LLM_FALLBACK_NOTE]
+        document = _assemble(state, {}, extra_notes)
+
+    return {"markdown": document, "risk_notes": extra_notes}
 
 
 # --- render -----------------------------------------------------------------
