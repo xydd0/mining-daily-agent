@@ -2,18 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## 当前状态：仅有配置与骨架
+## 当前状态
 
-本仓库已搭好工程化底座，但**尚无采集/编排/MCP 业务代码**：
+新闻链路已打通（`models` → `providers` → `servers`），其余仍是骨架：
 
-- `src/mining_daily_agent/config.py` 已实现：集中读取并校验环境变量，缺失时抛 `ConfigError`
-- `src/mining_daily_agent/__init__.py` 的 `main()` 是占位实现（已按「日志」规范用 `logging`，不再 `print`），待接入实际流程
-- `tests/` 已建立，当前只覆盖 `config` 与入口点
-- 已配置 `ruff` / `mypy` / `pytest`（含覆盖率门槛）与 `.pre-commit-config.yaml`
-- **没有 CI**
-- `README.md` 仍为空文件
+- `src/mining_daily_agent/config.py` — 环境变量集中读取与校验，缺失时抛 `ConfigError`
+- `src/mining_daily_agent/models/news.py` — `NewsItem` / `Article`（pydantic）
+- `src/mining_daily_agent/providers/news/` — `base.py`（`NewsProvider` Protocol）、`rss.py`（真实实现，3 个 RSS 源）、`mock.py`（降级实现，8 条内置数据）
+- `src/mining_daily_agent/servers/news_server.py` — `mining-news-mcp`，注册 `search` / `fetch_article` 两个工具
+- `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现，待接入实际流程
+- 「代码组织」中的 `client` 是**目标结构，尚未创建**
+- **没有 CI**；`README.md` 仍为空文件
 - git 仓库仍**没有任何 commit**
-- 「代码组织」中的 `servers` / `providers` / `client` / `models` 是**目标结构，目录尚未创建**；`config.py` 目前直接位于包根
+
+启动 MCP server：`uv run python -m mining_daily_agent.servers.news_server`（stdio）
 
 `pyproject.toml` 里的依赖声明的是**意图**，不是已实现的架构。在补全代码前，不要假设「代码组织」中列出的任何子包或模块已存在——请先 `ls src/mining_daily_agent/` 确认。
 
@@ -23,6 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Python 3.12**（`.python-version` 与 `pyproject.toml` 的 `requires-python = ">=3.12"` 一致）。注意系统默认 `python` 是 3.14，务必通过 `uv run` 调用，不要裸跑 `python`。
 - 采用 **src 布局**：代码放 `src/mining_daily_agent/`，`uv_build` 要求保持该结构。子包划分见「代码组织」。
 - 入口点：`mining_daily_agent:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
+- **依赖卫生问题**：代码直接 `import pydantic`，但 `pydantic` **没有**在 `pyproject.toml` 中声明，目前完全依赖 `mcp` 的传递依赖。若上游哪天去掉它，import 会直接失败。建议补一条显式声明（需用户确认，此前被要求"不新增依赖"）。
 
 ## 代码组织
 
@@ -66,8 +69,15 @@ src/mining_daily_agent/
 
 ## MCP 约定
 
-- 三个 MCP server **默认使用 stdio 传输**。
+- 三个 MCP server **默认使用 stdio 传输**（当前已实现 1 个）。
 - 工具函数必须有清晰的 docstring，说明**用途与各参数含义**——LLM 依赖这些描述来选择工具，描述不清会直接导致工具被选错或漏选。
+
+### mcp 2.x 实现要点（三条踩过的坑）
+
+- **`FastMCP` 不存在**。装的是 mcp 2.x，类名已改为 `MCPServer`：
+  `from mcp.server.mcpserver import MCPServer`。写 `from mcp.server.fastmcp import FastMCP` 会直接 ImportError。
+- **定义工具函数/模型的模块不能加 `from __future__ import annotations`**。MCP 注册工具时要解析真实类型注解来生成 JSON schema，注解被延迟求值会导致解析失败；pydantic 同理。`servers/news_server.py` 与 `models/news.py` 都因此刻意省略了这行，并写了注释说明。
+- **工具内故意抛的异常必须是 `ToolError`**（`mcp.server.mcpserver.exceptions`）。SDK 只原样转发 `ToolError` 的 message，其余异常一律被替换成 `Error executing tool xxx`，异常文本留在服务端。`InvalidArticleUrlError` 因此同时继承 `ValueError`（框架无关的入参语义）与 `ToolError`（消息可传递），不要"简化"成裸 `ValueError`——那会让提示信息静默消失。
 
 ## 提交规范
 

@@ -86,6 +86,21 @@ warn_redundant_casts = true
 no_implicit_reexport = true
 show_error_codes = true
 
+[[tool.mypy.overrides]]
+# pydantic 的 BaseModel 构造签名是 `(**data: Any)`，因此**任何**继承 BaseModel 的
+# 类都会在类定义行触发 explicit-any。这是框架层面的必然结果，改写业务代码无法消除。
+# 这里只对模型模块放开该项，其余模块仍保持最严格；
+# 模型内部的「禁止裸 Any」由 ruff 的 ANN401 继续把关函数签名。
+module = ["mining_daily_agent.models.*"]
+disallow_any_explicit = false
+
+[[tool.mypy.overrides]]
+# feedparser 既不提供 py.typed 也没有官方 stubs，只能整体放宽。
+# 其返回值按 Any 处理，但 rss.py 里所有取值都经 _text/_parse_datetime
+# 归一化后才使用，不会把 Any 泄漏到对外类型。
+module = ["feedparser"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
