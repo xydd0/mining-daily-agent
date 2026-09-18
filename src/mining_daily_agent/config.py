@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
 from dotenv import load_dotenv
 
@@ -18,6 +20,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_ENV_FILE = Path(".env")
 DEFAULT_NEWS_DAYS = 1
 REQUIRED_VARS: tuple[str, ...] = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
+
+#: 三个 MCP server 的名称与默认模块路径。名称同时是连接池里的路由键。
+DEFAULT_MCP_SERVERS: Final[tuple[tuple[str, str], ...]] = (
+    ("news", "mining_daily_agent.servers.news_server"),
+    ("pdf", "mining_daily_agent.servers.pdf_server"),
+    ("price", "mining_daily_agent.servers.price_server"),
+)
+#: 单次工具调用的默认超时秒数。
+DEFAULT_MCP_CALL_TIMEOUT_SECONDS: Final = 30.0
 
 
 class ConfigError(RuntimeError):
@@ -34,6 +45,23 @@ class Config:
     news_days_default: int
 
 
+@dataclass(frozen=True, slots=True)
+class McpServerSpec:
+    """一个 MCP server 的启动方式。"""
+
+    name: str
+    command: str
+    args: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class McpClientConfig:
+    """MCP client 连接池的配置。"""
+
+    servers: tuple[McpServerSpec, ...]
+    call_timeout_seconds: float
+
+
 def _collect_missing(names: tuple[str, ...]) -> list[str]:
     """收集取值缺失（未设置或仅空白）的变量名，保持传入顺序。"""
     return [name for name in names if not os.getenv(name, "").strip()]
@@ -45,6 +73,19 @@ def _validate_base_url(value: str) -> str:
         msg = f"环境变量 LLM_BASE_URL 必须以 http:// 或 https:// 开头，当前值为 {value!r}。"
         raise ConfigError(msg)
     return value
+
+
+def _load_env_file(env_file: Path | None = None) -> Path:
+    """加载 .env（若存在），返回实际使用的路径。
+
+    ``load_dotenv`` 用 ``override=False``：进程环境变量优先于文件，便于测试与 CI 覆盖。
+    """
+    path = DEFAULT_ENV_FILE if env_file is None else env_file
+    if path.is_file():
+        load_dotenv(dotenv_path=path, override=False)
+    else:
+        logger.debug("未找到环境文件 %s，仅使用进程环境变量。", path)
+    return path
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -61,6 +102,35 @@ def _positive_int(name: str, default: int) -> int:
         msg = f"环境变量 {name} 必须 >= 1，当前值为 {value}。"
         raise ConfigError(msg)
     return value
+
+
+def _positive_float(name: str, default: float) -> float:
+    """读取正浮点环境变量；未设置时返回 default。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        msg = f"环境变量 {name} 必须是数字，当前值为 {raw!r}。"
+        raise ConfigError(msg) from exc
+    if value <= 0:
+        msg = f"环境变量 {name} 必须 > 0，当前值为 {value}。"
+        raise ConfigError(msg)
+    return value
+
+
+def _mcp_launcher() -> tuple[str, tuple[str, ...]]:
+    """解析启动器可执行文件与附加参数。
+
+    - ``MCP_SERVER_LAUNCHER``：启动器，默认当前解释器 ``sys.executable``。连接池本身
+      就跑在项目 venv 里，直接用该解释器 ``-m`` 启动最省事，不必再经 ``uv run`` 解析一层。
+    - ``MCP_SERVER_LAUNCHER_ARGS``：插在 ``-m`` 之前的参数，按空白切分。例如设
+      ``MCP_SERVER_LAUNCHER=uv``、``MCP_SERVER_LAUNCHER_ARGS="run python"``，
+      即改回 ``uv run python -m ...`` 的启动方式。
+    """
+    command = os.getenv("MCP_SERVER_LAUNCHER", "").strip() or sys.executable
+    return command, tuple(os.getenv("MCP_SERVER_LAUNCHER_ARGS", "").split())
 
 
 def load_config(env_file: Path | None = None) -> Config:
@@ -80,11 +150,7 @@ def load_config(env_file: Path | None = None) -> Config:
         ConfigError: 必填项缺失或取值非法。所有缺失项会一次性列出，
             而不是遇到第一个就中断。
     """
-    path = DEFAULT_ENV_FILE if env_file is None else env_file
-    if path.is_file():
-        load_dotenv(dotenv_path=path, override=False)
-    else:
-        logger.debug("未找到环境文件 %s，仅使用进程环境变量。", path)
+    path = _load_env_file(env_file)
 
     missing = _collect_missing(REQUIRED_VARS)
     if missing:
@@ -108,3 +174,42 @@ def load_config(env_file: Path | None = None) -> Config:
         config.news_days_default,
     )
     return config
+
+
+def load_mcp_client_config(env_file: Path | None = None) -> McpClientConfig:
+    """读取 MCP client 连接池的配置。
+
+    三个 server 的模块路径经 ``MCP_<NAME>_SERVER_MODULE`` 覆盖
+    （``NAME`` 取 ``NEWS`` / ``PDF`` / ``PRICE``），启动器经 ``MCP_SERVER_LAUNCHER``
+    与 ``MCP_SERVER_LAUNCHER_ARGS`` 覆盖，调用超时经 ``MCP_CALL_TIMEOUT_SECONDS`` 覆盖。
+    全部有默认值，因此不配置也能直接跑。
+
+    Args:
+        env_file: 要加载的 .env 路径；为 None 时使用当前目录下的 ``.env``。
+
+    Returns:
+        连接池配置。
+
+    Raises:
+        ConfigError: 超时等取值非法。
+    """
+    _load_env_file(env_file)
+    command, extra_args = _mcp_launcher()
+    servers = tuple(
+        McpServerSpec(
+            name=name,
+            command=command,
+            args=(
+                *extra_args,
+                "-m",
+                os.getenv(f"MCP_{name.upper()}_SERVER_MODULE", "").strip() or module,
+            ),
+        )
+        for name, module in DEFAULT_MCP_SERVERS
+    )
+    return McpClientConfig(
+        servers=servers,
+        call_timeout_seconds=_positive_float(
+            "MCP_CALL_TIMEOUT_SECONDS", DEFAULT_MCP_CALL_TIMEOUT_SECONDS
+        ),
+    )

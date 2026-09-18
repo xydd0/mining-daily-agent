@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 当前状态
 
-规则要求的**三个 MCP server 已全部实现**（`models` → `providers` → `servers`），`client` 仍是空白：
+`models` → `providers` → `servers` → `client` 四层**已全部打通**：
 
 - `src/mining_daily_agent/config.py` — 环境变量集中读取与校验，缺失时抛 `ConfigError`
 - `models/news.py` — `NewsItem` / `Article`
@@ -16,16 +16,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `servers/news_server.py` — `mining-news-mcp`：`search` / `fetch_article`
 - `servers/pdf_server.py` — `mineral-pdf-mcp`：`extract_resources`
 - `servers/price_server.py` — `lme-price-mcp`：`get_price` / `get_trend`
+- `client/pool.py` — `McpConnectionPool`：并发连接三个 server、汇总工具、路由调用
+- `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
 - `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现，待接入实际流程
-- 「代码组织」中的 `client` 是**目标结构，尚未创建**
 - **没有 CI**；`README.md` 仍为空文件
 
-启动 MCP server（stdio）：
+启动单个 MCP server（stdio）：
 
 ```bash
 uv run python -m mining_daily_agent.servers.news_server
 uv run python -m mining_daily_agent.servers.pdf_server
 uv run python -m mining_daily_agent.servers.price_server
+```
+
+验收连接池（真实拉起三个 server，应打印 5 个工具）：
+
+```bash
+uv run python scripts/verify_pool.py
 ```
 
 `pyproject.toml` 里的依赖声明的是**意图**，不是已实现的架构。在补全代码前，不要假设「代码组织」中列出的任何子包或模块已存在——请先 `ls src/mining_daily_agent/` 确认。
@@ -89,6 +96,23 @@ src/mining_daily_agent/
   `from mcp.server.mcpserver import MCPServer`。写 `from mcp.server.fastmcp import FastMCP` 会直接 ImportError。
 - **定义工具函数/模型的模块不能加 `from __future__ import annotations`**。MCP 注册工具时要解析真实类型注解来生成 JSON schema，注解被延迟求值会导致解析失败；pydantic 同理。`servers/news_server.py` 与 `models/news.py` 都因此刻意省略了这行，并写了注释说明。
 - **工具内故意抛的异常必须是 `ToolError`**（`mcp.server.mcpserver.exceptions`）。SDK 只原样转发 `ToolError` 的 message，其余异常一律被替换成 `Error executing tool xxx`，异常文本留在服务端。`InvalidArticleUrlError` 因此同时继承 `ValueError`（框架无关的入参语义）与 `ToolError`（消息可传递），不要"简化"成裸 `ValueError`——那会让提示信息静默消失。
+
+### MCP client 连接池的实现约束
+
+- **每个 server 必须有一个长驻任务持有自己的会话**。`stdio_client` 内部用 anyio
+  任务组，其 cancel scope 只能在**进入它的那个任务**里退出；跨任务关闭会抛
+  "Attempted to exit cancel scope in a different task"。所以 `client/pool.py` 用
+  `_ServerWorker` 让每个 server 在自己的 `asyncio.Task` 里建立并关闭会话，
+  `aclose()` 只发停止信号再等它收尾。不要图省事改成在调用方任务里用
+  `AsyncExitStack` 进出——那样在真实 server 上必炸（测试里的假会话不会暴露它）。
+- **不要用 `monkeypatch.setattr(池模块, "ClientSession", 假类)` 来测**。假类不是
+  `ClientSession` 子类，mypy 会拒绝赋值；硬塞就得 `# type: ignore`。正确做法是替换
+  连接接缝 `pool._open_session`，用 `pool.McpSession` Protocol 描述连接池对会话的全部诉求。
+- `ClientSession.call_tool` 返回**联合类型**（`CallToolResult | InputRequiredResult | Result`），
+  调用方必须 `isinstance` 收窄，别假设它一定是 `CallToolResult`。
+- server 的启动方式全部来自 `config.load_mcp_client_config()`，默认用当前解释器
+  `sys.executable -m <module>`（连接池本就跑在项目 venv 里，不必再经 `uv run` 解析一层）。
+  改回 `uv run`：设 `MCP_SERVER_LAUNCHER=uv`、`MCP_SERVER_LAUNCHER_ARGS="run python"`。
 
 ### 价格工具的代理品种陷阱（重要）
 
