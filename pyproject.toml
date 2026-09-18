@@ -41,7 +41,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = [
@@ -80,7 +80,9 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests"]
+# 注意：门禁里的 `mypy src` 会覆盖这里的 files，只检查 src；
+# 裸跑 `mypy` 才按此列表检查全部三个目录。
+files = ["src", "tests", "scripts"]
 strict = true
 disallow_any_explicit = true
 warn_unused_ignores = true
