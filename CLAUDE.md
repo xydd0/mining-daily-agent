@@ -268,7 +268,7 @@ uv run ruff check --fix .  # 自动修可修的 lint 问题
 
 ## 已知缺口
 
-1. **`Article` / `ResourceReport` 正文长度无上限**。`Article.text` 不截断，
-   `ResourceReport.raw_snippets` 每条上限 1000 字符但条数不限，长文可能撑爆 LLM 上下文。
+1. **`ResourceReport.raw_snippets` 条数无上限**。每条上限 1000 字符，但条数不限，理论上
+   可能撑爆 LLM 上下文（`Article.text` 已有 8000 字符上限）。
 2. **门禁脚本只检查、不修改**。早先 pre-commit 的 `ruff --fix` / `ruff format` 钩子会
    顺手改文件，统一后没有了；提交被拦下需要手工跑一次格式化。

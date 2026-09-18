@@ -35,6 +35,9 @@ MAX_ATTEMPTS: Final = 3
 BACKOFF_BASE_SECONDS: Final = 0.5
 #: 摘要截断长度。
 SUMMARY_MAX_CHARS: Final = 500
+#: ``fetch_article`` 返回正文的字符上限。真实文章可达数十万字符，原样返回会把调用方
+#: （尤其 LLM）的上下文撑爆。
+ARTICLE_TEXT_MAX_CHARS: Final = 8000
 
 _TAG_RE: Final = re.compile(r"<[^>]+>")
 _WHITESPACE_RE: Final = re.compile(r"\s+")
@@ -119,12 +122,17 @@ def _fetch_bytes(url: str) -> bytes:
     raise RssFetchError(msg) from last_error
 
 
-def clean_summary(raw: str, limit: int = SUMMARY_MAX_CHARS) -> str:
-    """清洗摘要：去 HTML 标签、反转义实体、压缩空白，并截断到 ``limit`` 字符。"""
-    text = _WHITESPACE_RE.sub(" ", html.unescape(_TAG_RE.sub(" ", raw))).strip()
+def truncate_text(text: str, limit: int) -> str:
+    """截断到 ``limit`` 字符；被截断时以省略号结尾，总长仍是 ``limit``。"""
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def clean_summary(raw: str, limit: int = SUMMARY_MAX_CHARS) -> str:
+    """清洗摘要：去 HTML 标签、反转义实体、压缩空白，并截断到 ``limit`` 字符。"""
+    text = _WHITESPACE_RE.sub(" ", html.unescape(_TAG_RE.sub(" ", raw))).strip()
+    return truncate_text(text, limit)
 
 
 def _text(value: object) -> str:
@@ -252,7 +260,11 @@ class RssNewsProvider(NewsProvider):
 
         title = soup.title.get_text(strip=True) if soup.title else ""
         body = soup.find("article") or soup.body or soup
-        text = _WHITESPACE_RE.sub(" ", body.get_text(separator=" ", strip=True)).strip()
+        # 正文必须截断：真实页面动辄十几万字符，原样返回会撑爆调用方上下文。
+        text = truncate_text(
+            _WHITESPACE_RE.sub(" ", body.get_text(separator=" ", strip=True)).strip(),
+            ARTICLE_TEXT_MAX_CHARS,
+        )
 
         return Article(
             title=title or url,

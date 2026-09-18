@@ -230,6 +230,25 @@ def test_fetch_article_extracts_text_and_metadata(monkeypatch: pytest.MonkeyPatc
     assert "var tracker" not in article.text, "script 内容不应进入正文"
 
 
+def test_fetch_article_truncates_very_long_bodies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实页面可达十几万字符，原样返回会撑爆调用方（尤其 LLM）的上下文。"""
+    huge = "<html><body><article><p>" + ("锂矿正文。" * 5000) + "</p></article></body></html>"
+    monkeypatch.setattr(rss, "_http_get", _stub_get(huge))
+
+    article = RssNewsProvider().fetch_article("https://www.mining.com/huge/")
+
+    assert len(article.text) == rss.ARTICLE_TEXT_MAX_CHARS == 8000
+    assert article.text.endswith("…")
+
+
+def test_fetch_article_keeps_short_bodies_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rss, "_http_get", _stub_get("<html><body><p>Short body.</p></body></html>"))
+
+    article = RssNewsProvider().fetch_article("https://www.mining.com/short/")
+
+    assert article.text == "Short body."
+
+
 def test_fetch_article_falls_back_to_now_without_meta(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rss, "_http_get", _stub_get("<html><body><p>Body</p></body></html>"))
     before = datetime.now(UTC)
