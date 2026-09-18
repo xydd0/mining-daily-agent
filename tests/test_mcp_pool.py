@@ -58,6 +58,8 @@ class _FakeSpec:
     fail_call: bool = False
     fail_close: bool = False
     hang: bool = False
+    #: 连接握手永不返回——模拟「进程起来了但不回 MCP 握手」。
+    hang_connect: bool = False
     error_result: bool = False
 
 
@@ -143,6 +145,8 @@ def _install(monkeypatch: pytest.MonkeyPatch, registry: _Registry) -> None:
             msg = f"cannot spawn {spec.name}"
             raise RuntimeError(msg)
         registry.opened.append(spec.name)
+        if fake_spec.hang_connect:
+            await asyncio.sleep(3600)  # 卡在握手上，等启动超时来收
         if registry.expected_opens:
             # 栅栏：所有应当连上的 server 都进入后才放行。若连接是串行的，第一个
             # 会一直等到超时——这正是「并发连接」这条测试要证伪的情形。
@@ -215,6 +219,27 @@ async def test_open_session_receives_the_configured_command(
     pool = await McpConnectionPool.create(config)
     try:
         assert seen == [("uv", ("run", "python", "-m", "x"))]
+    finally:
+        await pool.aclose()
+
+
+async def test_a_server_that_hangs_on_startup_does_not_block_the_rest(
+    monkeypatch: pytest.MonkeyPatch, registry: _Registry, caplog: pytest.LogCaptureFixture
+) -> None:
+    """握手卡死的 server 必须被判为失败，其余照常连上。
+
+    没有启动超时的话，``_connect_all`` 的 gather 会一直等下去——「单个失败不阻塞
+    整体」也就成了空话：整条流水线卡在一个不响应的子进程上。
+    """
+    registry.specs["pdf"].hang_connect = True
+    monkeypatch.setattr(pool_module, "STARTUP_TIMEOUT_SECONDS", 0.05)
+
+    with caplog.at_level(logging.WARNING):
+        pool = await _open_pool(monkeypatch, registry, "news", "pdf", "price")
+    try:
+        assert pool.connected_servers == ("news", "price")
+        assert "超时" in pool.failed_servers["pdf"]
+        assert "启动超时" in caplog.text
     finally:
         await pool.aclose()
 
