@@ -1,8 +1,12 @@
-# 与本地完全同一套门禁：本地跑 `bash scripts/gate.sh`，这里也跑它。
-# 命令的单一事实来源在 scripts/gate.sh，本文件不重复列出 ruff/mypy/pytest。
+# 两个独立 job 并行：
+#   gate        —— 代码质量门禁，命令的唯一来源是 scripts/gate.sh（本地跑的是同一个脚本）
+#   docker-build —— 镜像构建验证
 #
-# 测试全部 mock 了网络与 LLM（见 CLAUDE.md「测试」），因此这里不需要任何密钥，
-# 也不需要联网访问外部数据源。
+# 拆成两个 job 而不是串成一个：构建失败与门禁失败在 PR 界面上能一眼区分；两者互不阻塞，
+# 反馈也更快。Dockerfile 的缺陷（比如漏 COPY 清单）只有真正构建才会暴露，读代码发现不了。
+#
+# 测试全部 mock 了网络与 LLM（见 CLAUDE.md「测试」），构建也不需要密钥，
+# 因此这里不需要任何 secrets，也不访问外部数据源。
 name: CI
 
 on:
@@ -28,3 +32,25 @@ jobs:
 
       - name: 质量门禁
         run: bash scripts/gate.sh
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 准备 Buildx
+        # Dockerfile 用了 `RUN --mount=type=cache`，需要 BuildKit；官方构建缓存
+        # （type=gha）也依赖 buildx。
+        uses: docker/setup-buildx-action@v4
+
+      - name: 构建镜像
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # 只验证能否构建，不推送到任何 registry。
+          push: false
+          # GHA 层缓存：依赖层只在 pyproject.toml / uv.lock 变化时才失效，
+          # 其余提交直接命中缓存，不必每次全量重装依赖。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -23,7 +23,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `scripts/verify_pool.py` — 人工验收入口，真实拉起三个 server 打印工具清单
 - `src/mining_daily_agent/__init__.py` 只有包说明；命令行入口统一在 `__main__.py`
   （`python -m mining_daily_agent` 与 console script `mining-daily-agent` 都走它）
-- **CI 已接入**（`.github/workflows/ci.yml`，跑同一套四项门禁）
+- **CI 已接入**（`.github/workflows/ci.yml`，两个并行 job：`gate` 跑同一套四项门禁、
+  `docker-build` 验证镜像可构建并启用 GHA 层缓存）
 - **已容器化**：`Dockerfile`（多阶段）+ `docker-compose.yml`，见「容器化」
 - `README.md` 仍为空文件
 
