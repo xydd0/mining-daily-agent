@@ -335,6 +335,55 @@ def test_a_following_ore_reserve_table_does_not_overwrite_the_resource_total() -
     )
 
 
+def test_only_the_table_with_the_largest_reported_total_is_kept() -> None:
+    """报告含**多个项目**的资源表时，只取报告自报口径最大的那一张。
+
+    实测内置年报里除 Pilgangoora（445 Mt）外还有 Colina（70.9 Mt）。两张表都抽、
+    再加起来得到 515.9 Mt——加起来的是两个项目，是个没有意义的和。比较必须是
+    **全局**的：逐块各自取最大仍会把它们加在一起。
+    """
+    text = (
+        "Category  Tonnage (Mt)  Grade (% Li2O)\n"
+        "Colina  Measured  28.6  1.31\n"
+        "Colina  Inferred  3.6   1.10\n"
+        "Sub total 32.2 1.25\n"
+        "\n"
+        "Category  Tonnage (Mt)  Grade (% Li2O)\n"
+        "Pilgangoora  Measured  19   1.31\n"
+        "Pilgangoora  Indicated 356  1.29\n"
+        "Sub total 375 1.29\n"
+    )
+
+    parsed = pdf_parser.parse_resources(text)
+
+    assert {round(item.tonnage_t / 1e6) for item in parsed.items} == {19, 356}
+    assert parsed.excluded_tables == ["Colina — 32.2 Mt"], "未计入的表要说清楚"
+
+
+def test_the_in_situ_view_is_disclosed_as_not_included() -> None:
+    """取全矿口径后，同一张表的 In-situ 分块也不再计入——披露用报告自报的 436，不是求和值。"""
+    parsed = pdf_parser.parse_resources(_pls_table_text())
+
+    assert parsed.excluded_tables == ["In‑situ — 436.0 Mt"]
+    assert sum(item.tonnage_t for item in parsed.items) == pytest.approx(445e6)
+
+
+def test_prose_figures_are_dropped_when_a_totalled_table_exists() -> None:
+    """有权威表格时，散落正文里的数字不再单独计入——往往是同一份资源量的另一种说法。"""
+    text = (
+        "The Indicated resource is estimated at 214 Mt at 1.15% Li2O.\n"
+        "\n"
+        "Category  Tonnage (Mt)  Grade (% Li2O)\n"
+        "Inferred  89  1.05\n"
+        "Sub total 89 1.05\n"
+    )
+
+    parsed = pdf_parser.parse_resources(text)
+
+    assert len(parsed.items) == 1, "正文里那条不该和表格里的一起计入"
+    assert parsed.items[0].category is ResourceCategory.INFERRED
+
+
 def test_reconciliation_records_the_difference() -> None:
     """解析合计与自报合计对不上时，差额要能直接读到，而不是只活在提示文案里。"""
     report = ResourceReport(

@@ -121,6 +121,16 @@ class ResourceReport(BaseModel):
             "counts. Null when the report has no recognisable total row."
         ),
     )
+    excluded_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Resource tables found in the report but deliberately NOT included in "
+            '`resources`, one entry per table (e.g. "Colina — 70.9 Mt"). Non-empty when '
+            "the report states several tables and only the one carrying the report's own "
+            "total is used — summing them would add up different projects. Say so when you "
+            "quote the figures."
+        ),
+    )
     reconciliation: ResourceReconciliation | None = Field(
         default=None,
         description=(

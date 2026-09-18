@@ -8,7 +8,7 @@ from typing import Annotated, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from mining_daily_agent.models.news import NewsItem
+from mining_daily_agent.models.news import Article, NewsItem
 from mining_daily_agent.models.prices import TrendSeries
 from mining_daily_agent.models.resources import ResourceReport
 
@@ -34,7 +34,7 @@ class FetchPlan(BaseModel):
             return " OR ".join(token for token in tokens if token)
         return value
 
-    days: int = Field(default=1, ge=1, le=30, description="新闻回溯天数（工具侧上限 30）")
+    days: int = Field(default=7, ge=1, le=30, description="新闻回溯天数（工具侧上限 30）")
     commodity: str = Field(default="lithium", description="传给价格工具的品种名")
     needs_pdf: bool = Field(default=True, description="是否需要抽取资源报告 PDF")
     rationale: str = Field(default="", description="LLM 给出的理由，仅用于日志与排错")
@@ -43,23 +43,21 @@ class FetchPlan(BaseModel):
 class BriefState(TypedDict):
     """每日简报流程的状态。
 
-    除需求列出的字段外，另有两个字段是流程本身必需的：
+    ``plan`` 是流程本身必需的字段：planner 的产出必须传给 fetch_data，否则两个节点
+    接不上。
 
-    - ``plan``：planner 的产出必须传给 fetch_data，否则两个节点接不上；
-    - ``highlights``：analyze 算出的价格统计与储量汇总，synthesize 要引用它们。
-
-    ``article`` 取被选作主源的新闻条目（fetch_data 挑出来的那条）。
+    ``news`` 是**已按主题主体过滤过**的条目（fetch_data 里完成），``article`` 是其中
+    最相关的那一条抓回来的正文，可能为 None（抓取失败不阻塞流程）。
     """
 
     topic: str
     plan: FetchPlan
     news: list[NewsItem]
-    article: NewsItem | None
+    article: Article | None
     resource_report: ResourceReport | None
     price_trend: TrendSeries | None
     #: risk_notes 有三个写入者——planner 的兜底提示、fetch_data 的降级记录、analyze
-    #: 的风险词命中。用 operator.add 归并，否则后写的节点会覆盖先写的。
+    #: 的风险词命中与交叉核对差额。用 operator.add 归并，否则后写的节点会覆盖先写的。
     risk_notes: Annotated[list[str], operator.add]
-    highlights: list[str]
     markdown: str
     citations: list[str]

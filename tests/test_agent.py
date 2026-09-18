@@ -30,7 +30,10 @@ from mining_daily_agent.agent.llm import (
     build_chat_openai,
 )
 from mining_daily_agent.agent.nodes import (
+    ARTICLE_EXCERPT_CHARS,
     DEGRADED_MARK,
+    MIN_PLAN_DAYS,
+    NEWS_HEADLINE_MAX_CHARS,
     ToolCaller,
     analyze,
     build_citations,
@@ -40,15 +43,16 @@ from mining_daily_agent.agent.nodes import (
     planner,
     report_path,
     slugify,
+    synthesize,
 )
-from mining_daily_agent.agent.state import FetchPlan
+from mining_daily_agent.agent.state import BriefState, FetchPlan
 from mining_daily_agent.config import (
     DEFAULT_REPORT_URL_BUILTIN,
     Config,
     default_report_url,
     reports_dir,
 )
-from mining_daily_agent.models.news import NewsItem
+from mining_daily_agent.models.news import Article, NewsItem
 from mining_daily_agent.models.prices import PricePoint
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
 from mining_daily_agent.providers.prices.base import build_trend_series
@@ -67,7 +71,16 @@ PLAN_REPLY = json.dumps(
     },
     ensure_ascii=False,
 )
-SUMMARY_REPLY = "## 概览\n\nPilbara 锂矿产量上升 [1]。\n\n## 价格与走势\n\n区间上涨 [3]。\n"
+#: LLM 在流水线里只写新闻小节的小标题与导语，回复形态是 JSON。
+LEDES_REPLY = json.dumps(
+    {
+        "items": [
+            {"index": 1, "headline": "Pilbara 产量回升", "lede": "产量环比上升，公司维持指引。"},
+            {"index": 2, "headline": "Pilbara 二连涨", "lede": "第二条只用了它自己的资料。"},
+        ]
+    },
+    ensure_ascii=False,
+)
 
 
 # --- 假实现 -----------------------------------------------------------------
@@ -201,6 +214,18 @@ def _report_payload() -> dict[str, object]:
     ).model_dump(mode="json")
 
 
+def _article_payload(**overrides: object) -> dict[str, object]:
+    """最相关那条新闻抓回来的正文。"""
+    defaults: dict[str, object] = {
+        "title": "Pilbara lithium output rises 0",
+        "url": NEWS_URL,
+        "source": "Example News",
+        "published_at": datetime(2026, 9, 18, tzinfo=UTC),
+        "text": "Pilbara said output rose 12% in the September quarter.",
+    }
+    return Article.model_validate({**defaults, **overrides}).model_dump(mode="json")
+
+
 def _plain_news_item(**overrides: object) -> dict[str, object]:
     """一条不含 ``.pdf`` 链接、也不带 report/resource 线索词的普通新闻。"""
     defaults: dict[str, object] = {
@@ -216,6 +241,7 @@ def _plain_news_item(**overrides: object) -> dict[str, object]:
 def _responses() -> dict[tuple[str, str], object]:
     return {
         ("news", "search"): _ok(_news_payload()),
+        ("news", "fetch_article"): _ok(_article_payload()),
         ("price", "get_trend"): _ok(_trend_payload()),
         ("pdf", "extract_resources"): _ok(_report_payload()),
     }
@@ -242,23 +268,32 @@ def _install_llm(monkeypatch: pytest.MonkeyPatch, *replies: str) -> _FakeLLM:
 async def test_full_pipeline_produces_markdown_with_sources_section(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(_responses())
 
     document = await run_daily_brief(TOPIC, pool=pool)
 
-    assert "## 概览" in document
-    assert "## 来源" in document
-    assert "Pilbara lithium output rises 0" in document, "新闻应进来源小节"
+    # 模板写死：标题与五节的名字必须一字不差。
+    assert "# 矿权日报 · Pilbara 锂矿 · " in document
+    for section in (
+        "## 一、新闻摘要",
+        "## 二、储量数据",
+        "## 三、价格走势",
+        "## 四、风险提示",
+        "## 引用源",
+    ):
+        assert section in document, f"缺少小节：{section}"
+
+    assert "Pilbara lithium output rises 0" in document, "新闻应进引用源"
     assert NEWS_URL in document
-    assert REPORT_URL in document, "资源报告的 source_url 应进来源"
-    assert "test-source" in document, "价格来源应进来源"
+    assert REPORT_URL in document, "资源报告的 source_url 应进引用源"
+    assert "test-source" in document, "价格来源应进引用源"
 
 
 async def test_full_pipeline_calls_every_expected_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(_responses())
 
     await run_daily_brief(TOPIC, pool=pool)
@@ -266,17 +301,21 @@ async def test_full_pipeline_calls_every_expected_tool(
     called = {(server, tool) for server, tool, _ in pool.calls}
     assert called == {
         ("news", "search"),
+        ("news", "fetch_article"),
         ("price", "get_trend"),
         ("pdf", "extract_resources"),
     }
     plan_call = next(call for call in pool.calls if call[:2] == ("news", "search"))
-    assert plan_call[2] == {"query": "pilbara lithium", "days": 3}
+    # PLAN_REPLY 里写的是 days=3，低于最小值，实际按 7 发出去。
+    assert plan_call[2] == {"query": "pilbara lithium", "days": 7}
+    article_call = next(call for call in pool.calls if call[:2] == ("news", "fetch_article"))
+    assert article_call[2] == {"url": NEWS_URL}, "只抓最相关的那一条"
 
 
 async def test_brief_is_written_to_the_reports_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(_responses())
 
     document = await run_daily_brief(TOPIC, pool=pool)
@@ -295,12 +334,12 @@ async def test_news_failure_does_not_block_the_brief(
 ) -> None:
     responses = _responses()
     responses[("news", "search")] = RuntimeError("news server down")
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
 
-    assert "## 来源" in document, "新闻挂了仍要产出简报"
-    assert "价格数据" in document, "其余数据源应照常进来源"
+    assert "## 引用源" in document, "新闻挂了仍要产出简报"
+    assert "价格数据" in document, "其余数据源应照常进引用源"
 
 
 async def test_tool_level_error_result_is_recorded_as_a_risk(
@@ -308,11 +347,11 @@ async def test_tool_level_error_result_is_recorded_as_a_risk(
 ) -> None:
     responses = _responses()
     responses[("price", "get_trend")] = _error("价格工具执行失败")
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
 
-    assert "## 来源" in document
+    assert "## 引用源" in document
     assert "test-source" not in document, "失败的价格源不应出现在来源里"
 
 
@@ -321,11 +360,11 @@ async def test_pdf_failure_does_not_block_the_brief(
 ) -> None:
     responses = _responses()
     responses[("pdf", "extract_resources")] = RuntimeError("pdf server down")
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
 
-    assert "## 来源" in document
+    assert "## 引用源" in document
     assert REPORT_URL not in document
 
 
@@ -340,11 +379,12 @@ async def test_synthesised_resource_data_is_disclosed_as_a_risk(
     payload["degraded"] = True
     responses = _responses()
     responses[("pdf", "extract_resources")] = _ok(payload)
-    llm = _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
 
-    await run_daily_brief(TOPIC, pool=_FakePool(responses))
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
 
-    assert "不可用于任何判断" in llm.prompts[-1], "降级声明必须进入合成提示词"
+    assert "不可用于任何判断" in document, "降级声明必须出现在风险提示里"
+    assert DEGRADED_MARK in document, "合成吨位要逐条标出"
 
 
 async def test_degraded_news_is_disclosed_in_the_prompt_and_marked(
@@ -356,21 +396,21 @@ async def test_degraded_news_is_disclosed_in_the_prompt_and_marked(
         item["degraded"] = True
     responses = _responses()
     responses[("news", "search")] = _ok(degraded)
-    llm = _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    llm = _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
 
     prompt = llm.prompts[-1]
-    assert "不得当作真实报道引用" in prompt, "降级新闻必须留下风险提示"
     assert DEGRADED_MARK in prompt, "资料块里应逐条标出降级条目"
-    assert DEGRADED_MARK in document, "来源小节应标出降级条目"
+    assert "不得当作真实报道引用" in document, "降级新闻必须留下风险提示"
+    assert DEGRADED_MARK in document, "引用源小节应标出降级条目"
 
 
 async def test_real_data_is_not_marked_as_degraded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """真实数据不能被打上降级标记，否则读者会以为整篇都不可信。"""
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
 
     document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
 
@@ -398,7 +438,7 @@ async def test_default_annual_report_beats_hint_matched_news(
             ).model_dump(mode="json")
         ]
     )
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(responses)
 
     await run_daily_brief(TOPIC, pool=pool)
@@ -414,7 +454,7 @@ async def test_configured_report_url_beats_the_builtin(
     responses = _responses()
     # 新闻里不能有 .pdf 链接，否则第一级就命中了，到不了年报这一级。
     responses[("news", "search")] = _ok([_plain_news_item()])
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(responses)
 
     await run_daily_brief(TOPIC, pool=pool)
@@ -436,7 +476,7 @@ async def test_hint_matched_news_is_the_last_resort(
     responses[("news", "search")] = _ok(
         [
             NewsItem(
-                title="Some company annual resource report",
+                title="Pilbara company annual resource report",
                 url="https://example.com/resource-summary",
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
@@ -444,7 +484,7 @@ async def test_hint_matched_news_is_the_last_resort(
             ).model_dump(mode="json")
         ]
     )
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(responses)
 
     await run_daily_brief(TOPIC, pool=pool)
@@ -459,13 +499,14 @@ async def test_hint_matched_news_is_the_last_resort(
 async def test_unparsable_plan_falls_back_to_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_llm(monkeypatch, "抱歉，我无法只输出 JSON。", SUMMARY_REPLY)
+    _install_llm(monkeypatch, "抱歉，我无法只输出 JSON。", LEDES_REPLY)
     pool = _FakePool(_responses())
 
     await run_daily_brief(TOPIC, pool=pool)
 
     plan_call = next(call for call in pool.calls if call[:2] == ("news", "search"))
-    assert plan_call[2]["query"] == TOPIC, "默认计划以整条主题作关键词"
+    assert plan_call[2]["query"] == "Pilbara Minerals", "默认计划用精确主体，不是整条主题"
+    assert plan_call[2]["days"] == 7, "默认回溯 7 天"
 
 
 async def test_planner_llm_failure_falls_back_to_default(
@@ -484,10 +525,33 @@ async def test_planner_llm_failure_falls_back_to_default(
 
     plan = result["plan"]
     assert isinstance(plan, FetchPlan)
-    assert plan.keywords == TOPIC, "默认计划以整条主题作关键词"
+    assert plan.keywords == "Pilbara Minerals", "默认计划用精确主体，不是整条主题"
+    assert plan.days == 7
     notes = result["risk_notes"]
     assert isinstance(notes, list)
     assert any("LLM 计划生成失败" in note for note in notes)
+
+
+async def test_planner_raises_a_too_short_lookback_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 实测会照着「今日简报」把 days 定成 1——一天的窗口搜不到东西。
+
+    真实跑过：days=1 时 Google News 只回来 1 条，还被主体过滤掉，新闻小节整个空掉。
+    """
+    _install_llm(
+        monkeypatch,
+        json.dumps(
+            {"keywords": "Pilbara Minerals", "days": 1, "commodity": "lithium", "needs_pdf": True}
+        ),
+    )
+
+    result = await planner(initial_state(TOPIC))
+
+    plan = result["plan"]
+    assert isinstance(plan, FetchPlan)
+    assert plan.days == MIN_PLAN_DAYS == 7
+    assert plan.keywords == "Pilbara Minerals", "只兜底天数，关键词照用 LLM 的"
 
 
 def test_parse_plan_accepts_json_in_a_code_fence() -> None:
@@ -560,14 +624,14 @@ async def test_pdf_link_is_preferred_over_hint_matching(
     responses[("news", "search")] = _ok(
         [
             NewsItem(
-                title="Raiden Resources eyes lithium exploration",
-                url="https://example.com/news-page",  # 名字里有 Resources，但不是 PDF
+                title="Pilbara explorer eyes lithium resource",
+                url="https://example.com/news-page",  # 名字里有 resource，但不是 PDF
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
                 summary="s",
             ).model_dump(mode="json"),
             NewsItem(
-                title="Annual report",
+                title="Pilbara annual report",
                 url="https://example.com/annual.PDF",  # 真 PDF，大小写不敏感
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
@@ -606,38 +670,12 @@ async def test_fetch_data_records_risk_notes_for_failures(
 # --- analyze ----------------------------------------------------------------
 
 
-async def test_analyze_summarises_price_and_tonnage() -> None:
-    state = initial_state(TOPIC)
-    state["price_trend"] = build_trend_series(
-        "lithium",
-        [
-            PricePoint(
-                commodity="lithium",
-                date=date(2026, 1, 1) + timedelta(days=index),
-                price=100.0 + index,
-                unit="USD/t",
-                source="t",
-            )
-            for index in range(35)
-        ],
-        "t",
-    )
-    state["resource_report"] = ResourceReport.model_validate(_report_payload())
+async def test_analyze_reports_the_cross_check_gap_as_a_risk() -> None:
+    """逐条求和与报告自报合计对不上时必须留痕，且不能把成因说死。
 
-    result = await analyze(state)
-
-    highlights = result["highlights"]
-    assert isinstance(highlights, list)
-    assert any("区间涨跌" in item for item in highlights)
-    assert any("Indicated 合计 300.0 Mt" in item for item in highlights)
-    assert any("Inferred 合计 89.0 Mt" in item for item in highlights)
-
-
-async def test_analyze_replaces_a_double_counted_sum_with_the_self_reported_total() -> None:
-    """JORC 表同时列分块小计与全矿总计，逐行相加会把同一份资源量算两遍。
-
-    实测一份真实年报把 356 Mt 的 Indicated 加成 760 Mt。报告自报合计更小时以自报为准，
-    并且必须留下提示——否则简报会把重复计算的数字当事实呈现。
+    JORC 表把同一份资源量按多种口径各列一遍会重复计入；报告里有多张**不同项目**的
+    资源表则会把两份资源量加在一起。实测内置年报两种成因同时存在（515.9 vs 445.0）。
+    容差分不出是哪一种，文案就得并列写出来。
     """
     state = initial_state(TOPIC)
     state["resource_report"] = ResourceReport(
@@ -660,23 +698,23 @@ async def test_analyze_replaces_a_double_counted_sum_with_the_self_reported_tota
                 grade_unit="%",
             ),
         ],
-        # 逐条求和 705 Mt，自报合计 445 Mt → 明显重复
+        # 逐条求和 705 Mt，自报合计 445 Mt → 偏差 +58.4%
         self_reported_total_t=445e6,
     )
 
     result = await analyze(state)
 
-    highlights = result["highlights"]
-    assert isinstance(highlights, list)
-    assert any("445.0 Mt" in item for item in highlights), "应以自报合计为准"
-    assert not any("705" in item for item in highlights), "不应再把重复求和高亮出去"
     notes = result["risk_notes"]
     assert isinstance(notes, list)
+    assert any("705.0 Mt" in note and "445.0 Mt" in note and "+58.4%" in note for note in notes), (
+        f"差额与偏差率都要写出来，实得 {notes}"
+    )
     assert any("重复计入" in note for note in notes)
+    assert any("不同项目的资源表" in note for note in notes), "成因不能只断言一种"
 
 
-async def test_analyze_keeps_per_category_totals_when_they_agree() -> None:
-    """自报合计与求和一致时不该误报重复——正常报告仍要给出分类别数字。"""
+async def test_analyze_is_silent_when_the_totals_agree() -> None:
+    """自报合计与求和一致时不该误报——正常报告不该无端背一条风险提示。"""
     payload = _report_payload()
     payload["self_reported_total_t"] = 389e6  # 与逐条求和（214+86+89）一致
     state = initial_state(TOPIC)
@@ -684,17 +722,13 @@ async def test_analyze_keeps_per_category_totals_when_they_agree() -> None:
 
     result = await analyze(state)
 
-    highlights = result["highlights"]
-    assert isinstance(highlights, list)
-    assert any("Indicated 合计 300.0 Mt" in item for item in highlights)
     assert result["risk_notes"] == []
 
 
 async def test_analyze_tolerates_a_difference_within_five_percent() -> None:
     """±5% 是容差分界线：容差内的偏差不该被当成重复计入。
 
-    JORC 表逐行四舍五入到 0.1 Mt，求和与自报合计差几个百分点是常态。为此把整张表
-    判为不可信、只报一个总数，反而丢掉了分类别信息。
+    JORC 表逐行四舍五入到 0.1 Mt，求和与自报合计差几个百分点是常态。
     """
     payload = _report_payload()
     payload["self_reported_total_t"] = 400e6  # 求和 389 Mt，偏差 -2.8%
@@ -703,30 +737,7 @@ async def test_analyze_tolerates_a_difference_within_five_percent() -> None:
 
     result = await analyze(state)
 
-    highlights = result["highlights"]
-    assert isinstance(highlights, list)
-    assert any("Indicated 合计 300.0 Mt" in item for item in highlights), "容差内仍给分类别数字"
     assert result["risk_notes"] == []
-
-
-async def test_analyze_falls_back_to_the_reported_total_beyond_the_tolerance() -> None:
-    """一旦越过 ±5%，求和值不再可信，改报自报合计并说明原因。"""
-    payload = _report_payload()
-    payload["self_reported_total_t"] = 360e6  # 求和 389 Mt，偏差 +8.1%
-    state = initial_state(TOPIC)
-    state["resource_report"] = ResourceReport.model_validate(payload)
-
-    result = await analyze(state)
-
-    highlights = result["highlights"]
-    assert isinstance(highlights, list)
-    assert any("自报资源量合计 360.0 Mt" in item for item in highlights)
-    assert not any("389" in item for item in highlights), "可疑的求和值不该被高亮出去"
-    notes = result["risk_notes"]
-    assert isinstance(notes, list)
-    assert any("重复计入" in note and "+8.1%" in note for note in notes), (
-        f"提示里要写明偏差与容差，实得 {notes}"
-    )
 
 
 async def test_analyze_flags_risk_keywords_in_headlines() -> None:
@@ -752,7 +763,244 @@ async def test_analyze_flags_risk_keywords_in_headlines() -> None:
 async def test_analyze_is_quiet_without_data() -> None:
     result = await analyze(initial_state(TOPIC))
 
-    assert result == {"highlights": [], "risk_notes": []}
+    assert result == {"risk_notes": []}
+
+
+# --- 模板渲染（写死的小节名与措辞）------------------------------------------
+
+
+def _state_with_report(payload: dict[str, object] | None = None) -> BriefState:
+    state = initial_state(TOPIC)
+    state["resource_report"] = ResourceReport.model_validate(payload or _report_payload())
+    return state
+
+
+def _state_with_trend() -> BriefState:
+    state = initial_state(TOPIC)
+    state["price_trend"] = build_trend_series(
+        "lithium",
+        [
+            PricePoint(
+                commodity="lithium",
+                date=date(2026, 1, 1) + timedelta(days=index),
+                price=100.0 + index,
+                unit="USD/t",
+                source="t",
+            )
+            for index in range(35)
+        ],
+        "t",
+    )
+    return state
+
+
+async def test_resources_section_says_ore_tonnage_and_keeps_commodity_out_of_it() -> None:
+    """吨位一律说「矿石量 X Mt」。
+
+    commodity 是**品位**所指的元素，不是吨位的单位——早期版本渲染成
+    「Measured Li2O 19.0 Mt」，是病句。
+    """
+    result = await synthesize(_state_with_report())
+
+    markdown = result["markdown"]
+    assert isinstance(markdown, str)
+    assert "## 二、储量数据" in markdown
+    assert "Indicated：矿石量 300.0 Mt，品位 1.15% Li2O" in markdown
+    assert "Inferred：矿石量 89.0 Mt，品位 1.05% Li2O" in markdown
+    assert "Li2O 300.0 Mt" not in markdown, "commodity 不能拼进吨位表述"
+    assert "Li2O 89.0 Mt" not in markdown
+    assert "- 合计：389.0 Mt" in markdown
+
+
+async def test_resources_section_states_when_no_grade_was_parsed() -> None:
+    """真实年报的列头按元素命名（``LiO (%)``），解析器认不出品位列，要如实说明。"""
+    payload = _report_payload()
+    resources = payload["resources"]
+    assert isinstance(resources, list)
+    for item in resources:
+        assert isinstance(item, dict)
+        item["grade"] = None
+        item["grade_unit"] = ""
+    result = await synthesize(_state_with_report(payload))
+
+    markdown = result["markdown"]
+    assert isinstance(markdown, str)
+    assert "该表未解析到品位数" in markdown
+    assert "品位 1.15%" not in markdown
+
+
+async def test_resources_section_prefers_the_reported_total_beyond_the_tolerance() -> None:
+    """越过 ±5% 时「合计」一行报自报合计，并指向风险提示。"""
+    payload = _report_payload()
+    payload["self_reported_total_t"] = 360e6  # 求和 389 Mt，偏差 +8.1%
+    result = await synthesize(_state_with_report(payload))
+
+    markdown = result["markdown"]
+    assert isinstance(markdown, str)
+    assert "- 合计：360.0 Mt（报告自报合计；" in markdown
+    assert "+8.1%" in markdown
+    assert "详见风险提示" in markdown
+
+
+async def test_price_section_follows_the_template() -> None:
+    result = await synthesize(_state_with_trend())
+
+    markdown = result["markdown"]
+    assert isinstance(markdown, str)
+    assert "## 三、价格走势" in markdown
+    assert "lithium：最新价 134 USD/t" in markdown
+    assert "区间涨跌 +34.00%" in markdown
+    assert "7 日均线 131，" in markdown
+    assert "30 日均线 119.5 [1]。" in markdown
+    assert "（t）" in markdown, "来源标注要原样落地"
+
+
+async def test_citation_numbers_match_the_reference_list() -> None:
+    """正文里的 [n] 必须指得准——这是模板写死之后唯一还会错位的地方。"""
+    state = _state_with_report()
+    state["price_trend"] = _state_with_trend()["price_trend"]
+    state["news"] = [
+        NewsItem(
+            title="Pilbara lithium output rises",
+            url="https://example.com/a",
+            source="Example",
+            published_at=datetime(2026, 9, 18, tzinfo=UTC),
+            summary="s",
+        )
+    ]
+    state["article"] = None
+
+    result = await synthesize(state)
+
+    markdown = result["markdown"]
+    assert isinstance(markdown, str)
+    citations = build_citations(state)
+    assert len(citations) == 3, "1 条新闻 + 资源报告 + 价格"
+    # 资源报告是第 2 条、价格是第 3 条 —— 正文里的标注必须与之一致。
+    assert "（来源 [2]，NI 43-101 资源量陈述）" in markdown
+    assert markdown.count("[2]") >= 2
+    assert "[3]" in markdown, "价格一行的编号"
+    for index, text in enumerate(citations, 1):
+        assert f"[{index}] {text}" in markdown, f"引用源小节缺少第 {index} 条"
+
+
+async def test_news_section_is_explicit_when_nothing_is_relevant() -> None:
+    """过滤后一条不剩时，小节仍在，但要说清楚为什么是空的。"""
+    result = await synthesize(initial_state(TOPIC))
+
+    markdown = result["markdown"]
+    assert isinstance(markdown, str)
+    assert "## 一、新闻摘要" in markdown
+    assert "本轮未检索到与「Pilbara 锂矿」直接相关的新闻。" in markdown
+
+
+async def test_irrelevant_news_is_filtered_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """与主题主体无关的条目不进简报。
+
+    实测 Google News 拿 "Pilbara" 检索，回来的头几条里就有 "Raiden Resources…Lithium
+    Market Conditions…"——只提 lithium 不算讲 Pilbara。
+    """
+    responses = _responses()
+    responses[("news", "search")] = _ok(
+        [
+            NewsItem(
+                title="Raiden Resources weighs lithium funding",
+                url="https://example.com/raiden",
+                source="Kalkine",
+                published_at=datetime(2026, 9, 18, tzinfo=UTC),
+                summary="Lithium market conditions weigh on exploration funding.",
+            ).model_dump(mode="json"),
+            NewsItem(
+                title="Pilbara Minerals lifts output",
+                url=NEWS_URL,
+                source="Example News",
+                published_at=datetime(2026, 9, 18, tzinfo=UTC),
+                summary="Output rose.",
+            ).model_dump(mode="json"),
+        ]
+    )
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    assert "Pilbara Minerals lifts output" in document
+    assert "Raiden Resources" not in document, "无关条目不进简报"
+    assert "与主题主体" in document, "剔除动作要在风险提示里留痕"
+
+
+async def test_headline_is_capped_at_the_spec_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """要点式小标题 ≤25 字——LLM 写超了由代码压，不指望它自己数。"""
+    _install_llm(
+        monkeypatch,
+        PLAN_REPLY,
+        json.dumps(
+            {"items": [{"index": 1, "headline": "很" * 60, "lede": "导语。"}]},
+            ensure_ascii=False,
+        ),
+    )
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    line = next(text for text in document.splitlines() if text.startswith("**1. "))
+    headline = line.removeprefix("**1. ").removesuffix("**")
+    assert len(headline) == NEWS_HEADLINE_MAX_CHARS == 25
+    assert headline.endswith("…")
+
+
+async def test_news_falls_back_to_title_and_summary_when_the_llm_gives_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 写不出导语时，用该条自己的标题与摘要顶上——简报不能因此缺一节。"""
+    _install_llm(monkeypatch, PLAN_REPLY)  # 只够 planner 用，导语那次没有回复
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(_responses()))
+
+    assert "**1. Pilbara lithium output" in document
+    assert "Output rose." in document, "摘要顶上当导语"
+
+
+async def test_article_text_is_truncated_to_the_excerpt_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正文进状态前截断——整篇正文动辄十几万字符，原样下去会撑爆 LLM 调用。"""
+    responses = _responses()
+    responses[("news", "fetch_article")] = _ok(_article_payload(text="长" * 20_000))
+    _install_llm(monkeypatch, PLAN_REPLY)
+    nodes_module.set_pool(_FakePool(responses))
+
+    result = await fetch_data(initial_state(TOPIC))
+
+    article = result["article"]
+    assert isinstance(article, Article)
+    assert len(article.text) == ARTICLE_EXCERPT_CHARS == 4000
+
+
+async def test_mock_data_still_renders_the_full_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mock 降级数据下模板也必须完整：降级不能让小节缺胳膊少腿。
+
+    验收要求的三样：``## 一、新闻摘要``、``## 引用源`` 与「矿石量」表述。
+    """
+    degraded_news = _news_payload()
+    for item in degraded_news:
+        item["degraded"] = True
+    report = _report_payload()
+    report["degraded"] = True
+    responses = _responses()
+    responses[("news", "search")] = _ok(degraded_news)
+    responses[("pdf", "extract_resources")] = _ok(report)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    assert "## 一、新闻摘要" in document
+    assert "## 二、储量数据" in document
+    assert "## 三、价格走势" in document
+    assert "## 四、风险提示" in document
+    assert "## 引用源" in document
+    assert "矿石量" in document
+    assert document.count(DEGRADED_MARK) >= 3, "降级新闻、降级资源量都要逐条标注"
 
 
 # --- render / 路径 ----------------------------------------------------------
@@ -843,7 +1091,7 @@ def _factory(pool: PoolHandle) -> object:
 async def test_run_daily_brief_closes_the_pool_it_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(_responses())
     monkeypatch.setattr(graph_module, "_create_pool", _factory(pool))
 
@@ -855,7 +1103,7 @@ async def test_run_daily_brief_closes_the_pool_it_created(
 async def test_run_daily_brief_leaves_an_injected_pool_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
     pool = _FakePool(_responses())
 
     await run_daily_brief(TOPIC, pool=pool)

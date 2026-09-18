@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Final, Protocol
 
@@ -19,7 +20,7 @@ from pydantic import BaseModel, ValidationError
 from mining_daily_agent.agent.llm import build_llm
 from mining_daily_agent.agent.state import BriefState, FetchPlan
 from mining_daily_agent.config import default_report_url, reports_dir
-from mining_daily_agent.models.news import NewsItem
+from mining_daily_agent.models.news import Article, NewsItem
 from mining_daily_agent.models.prices import TrendSeries
 from mining_daily_agent.models.resources import ResourceCategory, ResourceReport
 
@@ -80,10 +81,87 @@ def get_pool() -> ToolCaller:
 
 #: topic 命中这些词就按锂矿处理（需求：Pilbara/锂矿类默认需要 PDF）。
 LITHIUM_HINTS: Final[tuple[str, ...]] = ("lithium", "li2o", "pilbara", "spodumene", "锂")
-#: 默认计划的回溯天数。
-DEFAULT_PLAN_DAYS: Final = 3
+#: 默认计划的回溯天数（需求：缺省 7 天）。
+DEFAULT_PLAN_DAYS: Final = 7
+#: 取数计划的**最小**回溯天数。主题写的是「今日简报」，实测 LLM 会据此返回 days=1——
+#: 一天的窗口配上 Google News 的时效性，整条新闻链搜回来 1 条、还被主体过滤掉，
+#: 简报的新闻小节整个空掉。7 天是产品口径，不是优化项，所以在这里兜底而不是只写进提示词。
+MIN_PLAN_DAYS: Final = DEFAULT_PLAN_DAYS
 #: 价格走势的回看交易日数。
 TREND_DAYS: Final = 30
+#: 抓回来的正文在进简报前截断到多少字符（MCP 工具侧上限是 8000）。
+ARTICLE_EXCERPT_CHARS: Final = 4000
+#: 「要点式小标题」的字数上限。
+NEWS_HEADLINE_MAX_CHARS: Final = 25
+#: 默认计划用的**精确主体**：整条中文主题丢给 Google News 搜不到东西（实测），
+#: 必须落到英文实体名。键是主题里出现的线索词，值是检索用的主体。
+SUBJECT_HINTS: Final[tuple[tuple[str, str], ...]] = (
+    ("pilgangoora", "Pilbara Minerals"),
+    ("pilbara", "Pilbara Minerals"),
+    ("greenbushes", "Greenbushes lithium"),
+    ("wodgina", "Wodgina lithium"),
+    ("lithium", "lithium spodumene"),
+)
+#: 判相关性时要忽略的泛词。一条新闻光提 "lithium"/"market" 说明不了它讲的是
+#: **主题主体**——实测 Google News 拿 "Pilbara" 检索回来的头几条是
+#: "Raiden Resources…Lithium Market Conditions…"，与 Pilbara 无关。
+GENERIC_SUBJECT_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "lithium",
+        "nickel",
+        "copper",
+        "cobalt",
+        "mining",
+        "mine",
+        "mines",
+        "mineral",
+        "minerals",
+        "resource",
+        "resources",
+        "market",
+        "markets",
+        "price",
+        "prices",
+        "stock",
+        "stocks",
+        "share",
+        "shares",
+        "news",
+        "report",
+        "reports",
+        "today",
+        "daily",
+        "brief",
+        "and",
+        "the",
+        "for",
+        "with",
+    }
+)
+#: 请求式主题里的措辞，压「主体」时去掉。
+_TOPIC_FILLER: Final[tuple[str, ...]] = (
+    "给我",
+    "帮我",
+    "麻烦",
+    "请",
+    "生成",
+    "写",
+    "做",
+    "来",
+    "一份",
+    "一个",
+    "关于",
+    "有关",
+    "今日",
+    "今天",
+    "的",
+    "简报",
+    "日报",
+    "报告",
+)
+_LATIN_WORD_RE: Final = re.compile(r"[A-Za-z][A-Za-z.\-]*")
+_WORD_RE: Final = re.compile(r"[A-Za-z]{3,}")
+_WHITESPACE_RE: Final = re.compile(r"\s+")
 #: 新闻标题/摘要里出现即视为风险信号。
 RISK_KEYWORDS: Final[tuple[str, ...]] = (
     "halt",
@@ -111,27 +189,37 @@ _PLANNER_PROMPT: Final = """你是矿业研究助手。请为下面的简报主�
 只输出一个 JSON 对象，不要任何解释或 Markdown 围栏，字段如下：
 - "keywords": 传给新闻检索的关键词（英文效果最好）。字符串或字符串数组均可，
   多个相关词用数组给出覆盖面更好
-- "days": 新闻回溯天数，1-30 的整数
+- "days": 新闻回溯天数，1-30 的整数。**默认 7**，只有主题明确要求更短的时间窗
+  （如「只看今天」）才调小——窗口太短会搜不到东西
 - "commodity": 关注的大宗商品，只能是 lithium / nickel / copper / cobalt 之一
 - "needs_pdf": 是否需要抽取资源报告 PDF（涉及矿山项目、储量、资源量时为 true）
 - "rationale": 一句话说明理由
 """
 
-_SYNTHESIZE_PROMPT: Final = """你是矿业分析师。请根据下方资料，写一份关于「{topic}」的中文每日简报。
+#: 输出模板。**写死**：小节名、编号来源、吨位措辞全部由代码决定，不交给 LLM 发挥。
+BRIEF_TITLE: Final = "# 矿权日报 · {subject} · {date}"
+SECTION_NEWS: Final = "## 一、新闻摘要"
+SECTION_RESOURCE: Final = "## 二、储量数据"
+SECTION_PRICE: Final = "## 三、价格走势"
+SECTION_RISK: Final = "## 四、风险提示"
+SECTION_CITATIONS: Final = "## 引用源"
+
+#: LLM 在整条流水线里**只负责**新闻小节的小标题与导语——这两样确实需要理解正文。
+#: 其余小节全部由代码按模板渲染：小节名、编号对应、「矿石量」这类措辞是硬性约束，
+#: 靠提示词保证不了，靠代码可以。LLM 整个挂掉时，这一节退回「标题 + 摘要」的确定性写法。
+_NEWS_PROMPT: Final = """你是矿业分析师。下面每条新闻都有自己的编号与资料。
+
+请为**每一条**写要点式小标题与 2-3 句导语，只输出一个 JSON 对象：
+{{"items": [{{"index": 1, "headline": "…", "lede": "…"}}]}}
 
 硬性要求：
-- 用 Markdown，按需包含「## 概览」「## 价格与走势」「## 资源量」「## 风险提示」小节
-- **每条事实后面必须用 [编号] 标注来源**，编号对应「编号来源」清单
-- 资料里没有的数字一律不要编造；缺失的小节直接省略，不要写占位符
-- **标有「{degraded_mark}」的资料不是真实数据**：引用时必须写明它不可采信，
-  绝不能当作真实报道或真实资源量陈述
-- 正文控制在 400 字以内
+- 导语**只能**用该条自己那份资料，不得掺入任何其它条目的内容——把 A 条的正文配到
+  B 条标题下是严重错误
+- 时间、主体、数字都必须与该条资料一致；资料里没有的一律不写，不要推测
+- 小标题 ≤ {headline_max} 字，不带编号
+- 标有「{degraded_mark}」的资料不是真实报道，导语里必须写明这一点
 
-## 编号来源
-
-{sources}
-
-## 资料
+## 新闻资料
 
 {data}
 """
@@ -225,18 +313,92 @@ def _message_text(message: BaseMessage) -> str:
     return "".join(parts)
 
 
+# --- 主题主体与相关性 -------------------------------------------------------
+
+
+def brief_subject(topic: str) -> str:
+    """把请求式主题压成「主体」：``给我生成一份关于 Pilbara 锂矿的今日简报`` → ``Pilbara 锂矿``。
+
+    标题与资源小节都要用到它。压不出来时原样返回，宁可标题啰嗦也不要留空。
+    """
+    text = topic
+    for word in _TOPIC_FILLER:
+        text = text.replace(word, " ")
+    subject = _WHITESPACE_RE.sub(" ", text).strip(" 　·、,，。.：:；;")
+    return subject or topic.strip()
+
+
+def _subject_prefix(subject: str) -> str:
+    """取主体里的首个拉丁词当前缀（``Pilbara 锂矿`` → ``Pilbara``）。
+
+    资源小节读作 ``Pilbara Annual Report 2025（来源 [2]，…）``——年报解析出的
+    项目名常常只是文件名（如 ``Annual Report 2025``），没有前缀就不知道是谁的。
+    """
+    match = _LATIN_WORD_RE.search(subject)
+    return match.group(0) if match is not None else subject
+
+
+def plan_keywords(topic: str) -> str:
+    """默认计划的检索词：**精确主体**，不是整条主题。
+
+    Google News 搜不了整句中文（实测：拿中文主题去搜，返回的全是无关条目，整条数据链
+    就此降级）。命中不了线索词时退回主体本身——它至少是用户写的原话。
+    """
+    lowered = topic.casefold()
+    for hint, keyword in SUBJECT_HINTS:
+        if hint in lowered:
+            return keyword
+    return brief_subject(topic)
+
+
+def subject_tokens(topic: str, plan: FetchPlan) -> set[str]:
+    """判相关性用的**有区分度**主体词（小写）。
+
+    取自计划关键词与主题，去掉 ``lithium`` / ``minerals`` / ``market`` 这类泛词：
+    一条新闻光提 "lithium" 说明不了它讲的是主题主体。实测 Google News 拿 "Pilbara"
+    检索，头几条里就有 "Raiden Resources…Lithium Market Conditions…"。
+    """
+    haystack = f"{plan.keywords} {topic}"
+    return {
+        token.casefold()
+        for token in _WORD_RE.findall(haystack)
+        if token.casefold() not in GENERIC_SUBJECT_TOKENS
+    }
+
+
+def filter_relevant_news(
+    news: list[NewsItem], topic: str, plan: FetchPlan
+) -> tuple[list[NewsItem], int]:
+    """只保留**讲主题主体**的条目。
+
+    Returns:
+        ``(保留的条目, 被剔除的条数)``。主体词一个都挑不出来时不筛（无从判断，
+        宁可全留也不要凭一个空集合把新闻清空）。
+    """
+    tokens = subject_tokens(topic, plan)
+    if not tokens:
+        return list(news), 0
+    kept = [
+        item
+        for item in news
+        if any(token in f"{item.title} {item.summary}".casefold() for token in tokens)
+    ]
+    return kept, len(news) - len(kept)
+
+
 # --- planner ----------------------------------------------------------------
 
 
 def default_plan(topic: str) -> FetchPlan:
     """LLM 不可用或输出不可解析时的兜底计划。
 
-    Pilbara / 锂矿类主题默认需要 PDF（需求指定）。
+    Pilbara / 锂矿类主题默认需要 PDF（需求指定）。关键词用**精确主体**——见
+    :func:`plan_keywords`。
     """
     lowered = topic.casefold()
     is_lithium = any(hint in lowered for hint in LITHIUM_HINTS)
     return FetchPlan(
-        keywords=topic.strip(),
+        keywords=plan_keywords(topic),
         days=DEFAULT_PLAN_DAYS,
         commodity="lithium" if is_lithium else "copper",
         needs_pdf=is_lithium,
@@ -282,6 +444,10 @@ async def planner(state: BriefState) -> dict[str, object]:
         if not notes:
             notes.append("LLM 计划输出无法解析为 JSON，已使用默认计划。")
         plan = default_plan(topic)
+
+    if plan.days < MIN_PLAN_DAYS:
+        logger.info("回溯天数 %d 太短，按最小值 %d 处理", plan.days, MIN_PLAN_DAYS)
+        plan = plan.model_copy(update={"days": MIN_PLAN_DAYS})
 
     logger.info(
         "planner 完成：keywords=%r days=%d commodity=%s needs_pdf=%s",
@@ -357,6 +523,14 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
             "不得当作真实报道引用。"
         )
 
+    fetched = len(news)
+    news, dropped = filter_relevant_news(news, state["topic"], plan)
+    if dropped:
+        notes.append(
+            f"检索到 {fetched} 条新闻，其中 {dropped} 条与主题主体"
+            f"（{brief_subject(state['topic'])}）无关，已剔除。"
+        )
+
     trend: TrendSeries | None = None
     if isinstance(price_result, BaseException):
         notes.append(f"价格源失败，已降级：{type(price_result).__name__}: {price_result}")
@@ -384,12 +558,16 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
         # 合成吨位如果不加披露，简报会把它们当真实资源量呈现——那比报错更糟。
         notes.append("资源量为降级后的合成数据（PDF 未能真实解析），数值不可用于任何判断。")
 
-    article = news[0] if news else None
+    article: Article | None = None
+    if news:
+        article = await _fetch_article(pool, news[0], notes)
+
     logger.info(
-        "fetch_data 完成：news=%d trend=%s report=%s risks=%d",
+        "fetch_data 完成：news=%d trend=%s report=%s article=%s risks=%d",
         len(news),
         trend is not None,
         report is not None,
+        article is not None,
         len(notes),
     )
     return {
@@ -401,74 +579,72 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
     }
 
 
+async def _fetch_article(pool: ToolCaller, item: NewsItem, notes: list[str]) -> Article | None:
+    """抓**最相关那一条**的正文；限 1 篇，失败只记风险、不阻塞。
+
+    正文截断到 ``ARTICLE_EXCERPT_CHARS``（4000）：整篇正文动辄十几万字符，原样进状态
+    会撑爆后面那次 LLM 调用。
+    """
+    try:
+        result = await pool.call_tool("news", "fetch_article", {"url": item.url})
+        article = _model_from_result(result, Article)
+    except Exception as exc:  # 正文只是加分项，拿不到也要出简报
+        notes.append(f"正文抓取失败，该条导语改用标题与摘要：{type(exc).__name__}: {exc}")
+        return None
+
+    if not article.text.strip():
+        # 实测：Google News 的 <link> 是 JS 中转页，返回 200 但正文 0 字符。
+        notes.append(
+            "抓回的正文为空（Google News 的链接是 JS 中转页，实测正文 0 字符），"
+            "该条导语改用标题与摘要。"
+        )
+    if len(article.text) > ARTICLE_EXCERPT_CHARS:
+        article = article.model_copy(update={"text": article.text[:ARTICLE_EXCERPT_CHARS]})
+    return article
+
+
 # --- analyze ----------------------------------------------------------------
 
 
-def _price_highlight(trend: TrendSeries) -> str:
-    """把走势序列压成一行可引用的统计。"""
-    parts = [f"{trend.commodity} 区间涨跌 {trend.change_pct:+.2f}%"]
-    parts.append(f"区间 {trend.min:.4g}–{trend.max:.4g}")
-    if trend.ma7 is not None:
-        parts.append(f"ma7={trend.ma7:.4g}")
-    if trend.ma30 is not None:
-        parts.append(f"ma30={trend.ma30:.4g}")
-    return "；".join(parts) + f"（{len(trend.points)} 个交易日）"
+def _reconciliation_note(report: ResourceReport) -> str | None:
+    """解析合计与报告自报合计对不上时的风险提示。
 
-
-def _resource_highlights(report: ResourceReport) -> tuple[list[str], list[str]]:
-    """按类别汇总吨位，并与报告自报合计做交叉核对。
-
-    JORC 资源表同时列出**各分块小计**与**全矿总计**（Pilgangoora 的 In-situ 436 +
-    Stockpiles 9 与全矿总计 445 是同一份资源量的三种口径）。解析器已按分块去重，
-    这里再核一次：偏差超过 `ResourceReport.reconciliation` 里的容差（±5%）就说明
-    解析口径仍然不对，此时以**报告自报合计**为准并留下提示——一个可疑的求和值
-    不该冒充事实出现在简报里。
-
-    Returns:
-        ``(高亮行, 风险提示行)``。
+    JORC 表把同一份资源量按 In-situ / Stockpiles / 全矿三种口径各列一遍；报告里还可能
+    有**多个项目**的资源表（内置年报除 Pilgangoora 外还有 Colina）。两种成因都会让
+    求和值失真，容差分不出来，所以文案并列写出两种可能、不做断言。
     """
-    totals: dict[ResourceCategory, float] = {}
-    for item in report.resources:
-        totals[item.category] = totals.get(item.category, 0.0) + item.tonnage_t
-
     reconciliation = report.reconciliation
-    if reconciliation is not None and reconciliation.used_self_reported:
-        note = (
-            f"资源量按类别逐行求和得 {reconciliation.parsed_total_t / 1e6:.1f} Mt，"
-            f"与报告自报合计 {reconciliation.self_reported_total_t / 1e6:.1f} Mt 相差 "
-            f"{reconciliation.difference_ratio:+.1%}"
-            f"（超过 ±{reconciliation.tolerance:.0%} 容差）——求和值不可信"
-            "（常见于同一份资源量被重复计入，或多张不同项目的资源表被加在了一起），"
-            "已以报告自报合计为准。"
-        )
-        headline = (
-            f"{report.project_name} 自报资源量合计 "
-            f"{reconciliation.self_reported_total_t / 1e6:.1f} Mt"
-        )
-        return [headline], [note]
-
-    highlights: list[str] = []
-    for category in (ResourceCategory.INDICATED, ResourceCategory.INFERRED):
-        tonnes = totals.get(category)
-        if tonnes:
-            highlights.append(f"{report.project_name} {category.value} 合计 {tonnes / 1e6:.1f} Mt")
-    return highlights, []
+    if reconciliation is None or not reconciliation.used_self_reported:
+        return None
+    return (
+        f"资源量逐条明细求和得 {reconciliation.parsed_total_t / 1e6:.1f} Mt，"
+        f"与报告自报合计 {reconciliation.self_reported_total_t / 1e6:.1f} Mt 相差 "
+        f"{reconciliation.difference_ratio:+.1%}"
+        f"（超过 ±{reconciliation.tolerance:.0%} 容差）——求和值不可信"
+        "（常见于同一份资源量被重复计入，或多张不同项目的资源表被加在了一起），"
+        "已以报告自报合计为准。"
+    )
 
 
 async def analyze(state: BriefState) -> dict[str, object]:
-    """纯计算：价格统计、储量汇总、新闻标题里的风险词。"""
-    highlights: list[str] = []
-    notes: list[str] = []
+    """纯计算：资源量交叉核对差额 + 新闻标题里的风险词。
 
-    trend = state["price_trend"]
-    if trend is not None:
-        highlights.append(_price_highlight(trend))
+    价格与储量本身由 synthesize 按模板直接渲染，不在这里压成文案——模板写死之后，
+    「数字 → 句子」这一步必须唯一，多一条路径就多一处可能对不上的地方。
+    """
+    notes: list[str] = []
 
     report = state["resource_report"]
     if report is not None:
-        resource_highlights, resource_notes = _resource_highlights(report)
-        highlights.extend(resource_highlights)
-        notes.extend(resource_notes)
+        reconciliation_note = _reconciliation_note(report)
+        if reconciliation_note is not None:
+            notes.append(reconciliation_note)
+        if report.excluded_tables:
+            # 只报一张表就必须说清楚——否则读者会以为简报里的数字是报告的全部。
+            notes.append(
+                "资源量只取了报告自报口径最大的那张表，未计入的还有："
+                f"{'、'.join(report.excluded_tables)}。"
+            )
 
     for item in state["news"]:
         lowered = f"{item.title} {item.summary}".casefold()
@@ -476,7 +652,7 @@ async def analyze(state: BriefState) -> dict[str, object]:
         if hits:
             notes.append(f"风险信号（{'、'.join(hits)}）：{item.title}")
 
-    return {"highlights": highlights, "risk_notes": notes}
+    return {"risk_notes": notes}
 
 
 # --- synthesize -------------------------------------------------------------
@@ -502,48 +678,237 @@ def build_citations(state: BriefState) -> list[str]:
     return citations
 
 
-def _synthesis_data(state: BriefState) -> str:
-    """把状态里的数据整理成给 LLM 的资料块。"""
-    lines: list[str] = []
+def _citation_numbers(state: BriefState) -> dict[str, int]:
+    """类别 → 编号，只对 ``resource`` / ``price`` 有意义（新闻各自一条，编号即序号）。
 
-    if state["news"]:
-        lines.append("### 新闻")
-        lines.extend(
-            f"- [{index}] {DEGRADED_MARK if item.degraded else ''}{item.title}：{item.summary}"
-            for index, item in enumerate(state["news"], 1)
-        )
-
-    if state["highlights"]:
-        lines.append("### 计算结果")
-        lines.extend(f"- {item}" for item in state["highlights"])
-
+    顺序必须与 :func:`build_citations` 一致：新闻 1..N → 资源报告 → 价格。两处一致是
+    硬性要求（正文里的 [n] 要指得准），由 ``test_citation_numbers_match_the_reference_list``
+    盯着，不靠人记住。
+    """
+    numbers: dict[str, int] = {}
+    offset = len(state["news"])
     if state["resource_report"] is not None:
-        lines.append("### 资源量明细")
-        lines.extend(
-            f"- {item.category.value} {item.commodity}：{item.tonnage_t / 1e6:.1f} Mt"
-            + (f" @ {item.grade}{item.grade_unit}" if item.grade is not None else "")
-            for item in state["resource_report"].resources
+        offset += 1
+        numbers["resource"] = offset
+    if state["price_trend"] is not None:
+        offset += 1
+        numbers["price"] = offset
+    return numbers
+
+
+def _headline(text: str) -> str:
+    """压成 ≤ ``NEWS_HEADLINE_MAX_CHARS`` 字的小标题。"""
+    collapsed = _WHITESPACE_RE.sub(" ", text).strip()
+    if len(collapsed) <= NEWS_HEADLINE_MAX_CHARS:
+        return collapsed
+    return collapsed[: NEWS_HEADLINE_MAX_CHARS - 1].rstrip() + "…"
+
+
+@dataclass(frozen=True, slots=True)
+class NewsLede:
+    """一条新闻的小标题与导语。"""
+
+    headline: str
+    lede: str
+
+
+def _news_prompt_data(state: BriefState) -> str:
+    """整理给 LLM 的新闻资料：**每条只带自己**的标题、摘要与正文。
+
+    正文只挂在它自己所属的那一条上（``article.url == item.url``）。把 A 条的正文摆在
+    B 条旁边，是「标题与导语主体不一致」这类错误的直接来源。
+    """
+    article = state["article"]
+    blocks: list[str] = []
+    for index, item in enumerate(state["news"], 1):
+        mark = DEGRADED_MARK if item.degraded else ""
+        lines = [
+            f"[{index}] {mark}{item.title}",
+            f"    来源：{item.source}　发布：{item.published_at.date().isoformat()}",
+            f"    摘要：{_WHITESPACE_RE.sub(' ', item.summary).strip() or '（无）'}",
+        ]
+        if article is not None and article.url == item.url:
+            body = _WHITESPACE_RE.sub(" ", article.text).strip()
+            lines.append(f"    正文：{body or '（抓到的正文为空）'}")
+        else:
+            lines.append("    正文：（未抓取，只能用标题与摘要）")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _parse_ledes(text: str) -> dict[int, NewsLede]:
+    """解析 LLM 给出的 ``{"items": [...]}``；形状不对的条目直接丢弃（走兜底写法）。"""
+    payload = _extract_json_object(text)
+    if payload is None:
+        return {}
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return {}
+
+    ledes: dict[int, NewsLede] = {}
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("index")
+        headline = entry.get("headline")
+        lede = entry.get("lede")
+        if not isinstance(index, int) or not isinstance(headline, str) or not isinstance(lede, str):
+            continue
+        if not headline.strip() or not lede.strip():
+            continue
+        ledes[index] = NewsLede(headline=_headline(headline), lede=lede.strip())
+    return ledes
+
+
+def _fallback_lede(item: NewsItem) -> NewsLede:
+    """LLM 没给出这一条时的确定性写法：标题当小标题，摘要当导语。"""
+    summary = _WHITESPACE_RE.sub(" ", item.summary).strip()
+    lede = summary or f"{item.source} 于 {item.published_at.date().isoformat()} 报道：{item.title}"
+    if item.degraded:
+        lede = f"{DEGRADED_MARK}{lede}"
+    return NewsLede(headline=_headline(item.title), lede=lede)
+
+
+async def _news_ledes(state: BriefState) -> dict[int, NewsLede]:
+    """让 LLM 为每条新闻写小标题与导语；整段失败就统一退回标题 + 摘要。"""
+    prompt = _NEWS_PROMPT.format(
+        data=_news_prompt_data(state),
+        degraded_mark=DEGRADED_MARK,
+        headline_max=NEWS_HEADLINE_MAX_CHARS,
+    )
+    try:
+        response = await build_llm().ainvoke(prompt)
+    except Exception as exc:  # 简报必须出得来，LLM 挂了不是中断流程的理由
+        logger.warning("新闻导语生成失败，改用标题与摘要：%s: %s", type(exc).__name__, exc)
+        return {}
+    return _parse_ledes(_message_text(response))
+
+
+# --- 模板渲染 ---------------------------------------------------------------
+# 模板是**写死**的：小节名、每行的措辞、编号对应都由代码决定。LLM 只填新闻小节。
+
+
+def _render_title(state: BriefState) -> str:
+    return BRIEF_TITLE.format(
+        subject=brief_subject(state["topic"]),
+        date=datetime.now(UTC).date().isoformat(),
+    )
+
+
+def _render_news(state: BriefState, ledes: dict[int, NewsLede]) -> str:
+    if not state["news"]:
+        return (
+            f"{SECTION_NEWS}\n\n本轮未检索到与「{brief_subject(state['topic'])}」直接相关的新闻。"
         )
+    blocks = [SECTION_NEWS]
+    for index, item in enumerate(state["news"], 1):
+        lede = ledes.get(index) or _fallback_lede(item)
+        blocks.append(f"**{index}. {lede.headline}**\n{lede.lede} [{index}]")
+    return "\n\n".join(blocks)
 
-    if state["risk_notes"]:
-        lines.append("### 风险提示")
-        lines.extend(f"- {item}" for item in state["risk_notes"])
 
-    return "\n".join(lines) if lines else "（本次没有取到任何数据）"
+def _render_resources(state: BriefState) -> str:
+    report = state["resource_report"]
+    if report is None or not report.resources:
+        return f"{SECTION_RESOURCE}\n\n本轮未取到资源量陈述。"
+
+    number = _citation_numbers(state).get("resource")
+    cite = f"（来源 [{number}]，NI 43-101 资源量陈述）：" if number is not None else "："
+    header = f"{_subject_prefix(brief_subject(state['topic']))} {report.project_name}{cite}"
+
+    totals: dict[ResourceCategory, float] = {}
+    for item in report.resources:
+        totals[item.category] = totals.get(item.category, 0.0) + item.tonnage_t
+    # 同一类别出现多行时取**第一行**的品位：JORC 表把该类别的主行排在前面。
+    # 品位本身在真实年报上多不可靠（见 docs/architecture.md 的已知取舍），
+    # 渲染的是解析到的原值，不做加权、不做推测。
+    grades: dict[ResourceCategory, tuple[float, str, str]] = {}
+    for item in report.resources:
+        if item.grade is not None:
+            grades.setdefault(item.category, (item.grade, item.grade_unit, item.commodity))
+
+    bullets: list[str] = []
+    # 固定 Measured → Indicated → Inferred 顺序，不按字典序也不按出现顺序。
+    for category in (
+        ResourceCategory.MEASURED,
+        ResourceCategory.INDICATED,
+        ResourceCategory.INFERRED,
+    ):
+        tonnes = totals.get(category)
+        if not tonnes:
+            continue
+        grade = grades.get(category)
+        suffix = f"，品位 {grade[0]}{grade[1]} {grade[2]}" if grade is not None else ""
+        # 吨位**只能**说「矿石量 X Mt」：commodity 是品位所指的元素，不是吨位的单位，
+        # 写成「Li2O 19.0 Mt」是病句（早期版本真这么写过）。
+        bullets.append(f"- {category.value}：矿石量 {tonnes / 1e6:.1f} Mt{suffix}")
+    if not grades:
+        bullets.append("- 品位：该表未解析到品位数")
+
+    total = sum(totals.values())
+    reconciliation = report.reconciliation
+    if reconciliation is None:
+        bullets.append(f"- 合计：{total / 1e6:.1f} Mt（报告未给出自报合计，此为明细求和）")
+    elif reconciliation.used_self_reported:
+        bullets.append(
+            f"- 合计：{reconciliation.self_reported_total_t / 1e6:.1f} Mt（报告自报合计；"
+            f"明细求和 {total / 1e6:.1f} Mt，相差 {reconciliation.difference_ratio:+.1%}，"
+            "详见风险提示）"
+        )
+    else:
+        bullets.append(f"- 合计：{total / 1e6:.1f} Mt（与报告自报合计一致）")
+
+    return "\n\n".join([SECTION_RESOURCE, header, "\n".join(bullets)])
+
+
+def _render_price(state: BriefState) -> str:
+    trend = state["price_trend"]
+    if trend is None:
+        return f"{SECTION_PRICE}\n\n本轮未取到价格数据。"
+
+    number = _citation_numbers(state).get("price")
+    cite = f" [{number}]" if number is not None else ""
+    latest = trend.points[-1]
+    ma7 = f"{trend.ma7:.4g}" if trend.ma7 is not None else "数据不足"
+    ma30 = f"{trend.ma30:.4g}" if trend.ma30 is not None else "数据不足"
+    line = (
+        f"{trend.commodity}：最新价 {latest.price:.4g} {latest.unit}，"
+        f"区间涨跌 {trend.change_pct:+.2f}%，7 日均线 {ma7}，30 日均线 {ma30}{cite}。"
+    )
+    # 尾注用数据源自带的说明，不自己改写：代理品种的免责声明必须原样落地。
+    return "\n\n".join([SECTION_PRICE, line, f"（{trend.source}）"])
+
+
+def _render_risks(state: BriefState) -> str:
+    notes = state["risk_notes"]
+    body = "\n".join(f"- {note}" for note in notes) if notes else "本轮无重大风险事件。"
+    return f"{SECTION_RISK}\n\n{body}"
+
+
+def _render_citations(state: BriefState) -> str:
+    citations = build_citations(state)
+    if not citations:
+        return f"{SECTION_CITATIONS}\n\n（本次没有取到可引用的来源）"
+    body = "\n".join(f"[{index}] {text}" for index, text in enumerate(citations, 1))
+    return f"{SECTION_CITATIONS}\n\n{body}"
 
 
 async def synthesize(state: BriefState) -> dict[str, object]:
-    """调 LLM 把各方资料合成 Markdown 简报正文。"""
-    citations = build_citations(state)
-    sources = "\n".join(f"{index}. {text}" for index, text in enumerate(citations, 1))
-    prompt = _SYNTHESIZE_PROMPT.format(
-        topic=state["topic"],
-        sources=sources or "（无来源）",
-        data=_synthesis_data(state),
-        degraded_mark=DEGRADED_MARK,
-    )
-    response = await build_llm().ainvoke(prompt)
-    return {"markdown": _message_text(response).strip()}
+    """按写死的模板渲染简报正文。
+
+    LLM 只写新闻小节的小标题与导语——那两样确实需要读正文；其余小节全部由代码渲染。
+    小节名、编号对应、「矿石量」这类措辞是硬性约束，靠提示词保证不了，靠代码可以。
+    """
+    ledes = await _news_ledes(state) if state["news"] else {}
+    blocks = [
+        _render_title(state),
+        _render_news(state, ledes),
+        _render_resources(state),
+        _render_price(state),
+        _render_risks(state),
+        _render_citations(state),
+    ]
+    return {"markdown": "\n\n".join(blocks).rstrip() + "\n"}
 
 
 # --- render -----------------------------------------------------------------
@@ -562,17 +927,14 @@ def report_path(topic: str, today: date | None = None) -> Path:
 
 
 async def render(state: BriefState) -> dict[str, object]:
-    """拼上「来源」小节、写入文件，返回最终 Markdown。"""
-    citations = build_citations(state)
-    body = state["markdown"].rstrip()
-    if citations:
-        sources = "\n".join(f"{index}. {text}" for index, text in enumerate(citations, 1))
-        document = f"{body}\n\n## 来源\n\n{sources}\n"
-    else:
-        document = f"{body}\n\n## 来源\n\n（本次没有取到可引用的来源）\n"
+    """写入文件，返回最终 Markdown。
 
+    正文已由 synthesize 按模板渲染完毕（含「引用源」小节），这里不再拼接任何内容——
+    拼接逻辑散在两个节点里，改了一处漏一处就会正文与落盘文件不一致。
+    """
+    document = state["markdown"]
     path = report_path(state["topic"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(document, encoding="utf-8")
     logger.info("简报已写入：path=%s chars=%d", path, len(document))
-    return {"markdown": document, "citations": citations}
+    return {"markdown": document, "citations": build_citations(state)}

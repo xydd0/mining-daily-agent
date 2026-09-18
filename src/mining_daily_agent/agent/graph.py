@@ -89,7 +89,6 @@ def initial_state(topic: str) -> BriefState:
         resource_report=None,
         price_trend=None,
         risk_notes=[],
-        highlights=[],
         markdown="",
         citations=[],
     )
