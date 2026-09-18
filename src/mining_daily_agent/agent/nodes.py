@@ -297,21 +297,37 @@ async def planner(state: BriefState) -> dict[str, object]:
 
 
 def _pick_report_url(news: list[NewsItem]) -> str | None:
-    """挑一条最可能指向资源报告的新闻 URL；没有就退回可配置的默认年报 URL。
+    """挑一个交给 ``pdf.extract_resources`` 的地址，按确定性从高到低尝试。
 
-    分两轮：先找真正的 ``.pdf`` 链接，再退而求其次找标题/链接里带 resource、report
-    等线索词的条目。两轮是必要的——矿业公司名里带 "Resources" 极其常见（如
-    "Raiden Resources"），一轮混着判会把普通新闻页当成报告，实测踩过。
+    优先级：
+
+    1. 新闻里**真正以 ``.pdf`` 结尾**的链接；
+    2. ``config.default_report_url()``——可配置的**确定性**年报地址；
+    3. 标题/链接里带 resource、report 等线索词的新闻条目。
+
+    2 排在 3 前面是这条链路的要害：**Google News 返回的条目几乎不是 .pdf**，而线索词
+    命中的绝大多数是普通新闻网页（矿业公司名里带 "Resources" 极常见，如
+    "Raiden Resources"）。把新闻页喂给 PDF 解析器只会解析失败，再降级成 mock——
+    也就是说挑到哪条全看运气，每跑一次结果都可能不同。回溯到确定的年报就没有这个问题。
+
+    ⚠️ 3 是**保底分支，当前实际上不可达**：``default_report_url()`` 有内置默认值，
+    不会返回空串，所以走到 ``for`` 循环前必定已经 return。保留它是因为「确定性优先」
+    这条原则要写死在代码里——万一将来内置默认值被去掉或可被显式关闭，它仍然接得住，
+    而不至于变成「挑到哪条看运气」。
     """
     pdf_urls = [item.url for item in news if item.url.casefold().endswith(".pdf")]
     if pdf_urls:
         return pdf_urls[0]
 
+    configured = default_report_url()
+    if configured:
+        return configured
+
     for item in news:
         haystack = f"{item.title} {item.url}".casefold()
         if any(hint in haystack for hint in RESOURCE_HINTS):
             return item.url
-    return default_report_url() or None
+    return None
 
 
 async def fetch_data(state: BriefState) -> dict[str, object]:

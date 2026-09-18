@@ -32,6 +32,14 @@ DEFAULT_MCP_CALL_TIMEOUT_SECONDS: Final = 30.0
 #: 简报输出目录的默认值，可经 REPORTS_DIR 覆盖。
 DEFAULT_REPORTS_DIR: Final = Path("reports")
 
+#: 兜底年报的内置默认值：Pilbara Minerals 2025 年报（含官方 Mineral Resource 表）。
+#: 实测可下载（15.6 MB / 186 页），且 pdfplumber 能从中抽出资源量条目。
+#: 注意这是**公司专项**地址，见 default_report_url() 的说明。
+DEFAULT_REPORT_URL_BUILTIN: Final = (
+    "https://www.pls.com/storage/announcements/"
+    "2025-annual-report-incorporating-appendix-4e-2025-08-25.pdf"
+)
+
 
 class ConfigError(RuntimeError):
     """环境变量缺失或取值非法。"""
@@ -189,13 +197,18 @@ def reports_dir() -> Path:
 
 
 def default_report_url() -> str:
-    """新闻里找不到资源报告 PDF 时的兜底年报 URL；未配置时返回空串。
+    """兜底年报 URL：环境变量 ``DEFAULT_REPORT_URL`` 优先，未配置时用内置默认值。
 
-    这里**故意不设非空默认值**：真实年报地址随公司而异，硬编码一个占位地址只会让
-    ``pdf.extract_resources`` 每次都失败并悄悄降级成 mock 数据。留空时上层会跳过
-    取数并记一条风险提示，比返回编造的数据诚实。
+    内置值让「新闻里没有 PDF 线索」时仍有一条**确定性**的取数路径——否则每次挑到
+    哪条新闻全看运气（实测关键词匹配经常命中的是普通新闻页，传给 PDF 工具必然解析
+    失败并降级成 mock）。
+
+    ⚠️ 内置默认值是 **Pilbara Minerals 专项**（该公司的官方年报）。非锂矿主题应当
+    自行设置 ``DEFAULT_REPORT_URL``，或让取数计划把 ``needs_pdf`` 设为 false——
+    否则会拿一份锂矿年报去回答铜、镍之类的问题。
     """
-    return os.getenv("DEFAULT_REPORT_URL", "").strip()
+    configured = os.getenv("DEFAULT_REPORT_URL", "").strip()
+    return configured or DEFAULT_REPORT_URL_BUILTIN
 
 
 def load_mcp_client_config(env_file: Path | None = None) -> McpClientConfig:

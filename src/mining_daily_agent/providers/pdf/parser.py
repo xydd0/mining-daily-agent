@@ -22,6 +22,7 @@ import httpx
 import pdfplumber
 
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
+from mining_daily_agent.providers import BROWSER_USER_AGENT
 from mining_daily_agent.providers.pdf.base import PdfProvider
 
 logger = logging.getLogger(__name__)
@@ -96,9 +97,16 @@ class PdfFetchError(RuntimeError):
 def _http_get(url: str) -> httpx.Response:
     """发出单次 GET。
 
-    这是本模块唯一的 HTTP 接缝：超时在此统一设置，测试也在这里替换。
+    这是本模块唯一的 HTTP 接缝：超时与请求头在此统一设置，测试也在这里替换。
+
+    带浏览器 UA：不少站点对非浏览器 UA 直接 403（实测 mining.com 的文章页）。
     """
-    return httpx.get(url, timeout=PDF_TIMEOUT_SECONDS, follow_redirects=True)
+    return httpx.get(
+        url,
+        timeout=PDF_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        headers={"User-Agent": BROWSER_USER_AGENT, "Accept": "application/pdf,*/*"},
+    )
 
 
 def _validate_pdf_response(response: httpx.Response) -> None:

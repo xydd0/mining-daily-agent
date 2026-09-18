@@ -10,6 +10,7 @@ import io
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem
+from mining_daily_agent.providers import BROWSER_USER_AGENT
 from mining_daily_agent.providers import pdf as pdf_pkg
 from mining_daily_agent.providers.pdf import mock as pdf_mock
 from mining_daily_agent.providers.pdf import parser as pdf_parser
@@ -373,6 +375,37 @@ def test_http_get_sets_explicit_timeout(monkeypatch: pytest.MonkeyPatch) -> None
     pdf_parser._http_get(REPORT_URL)
 
     assert seen["timeout"] == pdf_parser.PDF_TIMEOUT_SECONDS == 30.0
+
+
+def test_http_get_sends_a_browser_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不少站点对非浏览器 UA 直接 403（实测 mining.com 的文章页），必须带上。"""
+    seen: dict[str, object] = {}
+
+    def _fake(url: str, **kwargs: object) -> httpx.Response:
+        seen.update(kwargs)
+        return _pdf_response(url, FAKE_PDF_PAYLOAD)
+
+    monkeypatch.setattr(httpx, "get", _fake)
+
+    pdf_parser._http_get(REPORT_URL)
+
+    headers = seen["headers"]
+    assert isinstance(headers, dict)
+    assert headers["User-Agent"] == BROWSER_USER_AGENT
+    assert "Mozilla" in str(headers["User-Agent"])
+
+
+def test_user_agent_is_defined_in_exactly_one_place() -> None:
+    """同一个 UA 字符串在多处各写一份，迟早改一处漏一处。"""
+    sources = (Path(__file__).resolve().parents[1] / "src").rglob("*.py")
+
+    defining = [
+        path.name
+        for path in sources
+        if "Mozilla/5.0 (Windows NT 10.0" in path.read_text(encoding="utf-8")
+    ]
+
+    assert defining == ["__init__.py"], "UA 只应定义在 providers/__init__.py"
 
 
 def test_download_retries_with_exponential_backoff(monkeypatch: pytest.MonkeyPatch) -> None:

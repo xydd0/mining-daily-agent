@@ -24,6 +24,7 @@ from typing import Final, override
 import httpx
 
 from mining_daily_agent.models.prices import PricePoint, TrendSeries
+from mining_daily_agent.providers import BROWSER_USER_AGENT
 from mining_daily_agent.providers.prices.base import (
     PriceProvider,
     PriceUnavailableError,
@@ -46,11 +47,6 @@ BACKOFF_BASE_SECONDS: Final = 0.5
 STOOQ_URL_TEMPLATE: Final = "https://stooq.com/q/d/l/?s={symbol}&i=d"
 YAHOO_URL_TEMPLATE: Final = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
-#: Yahoo 的 chart 端点对非浏览器 UA 会拒绝，实测需要一个常规浏览器 UA。
-BROWSER_USER_AGENT: Final = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
-)
 
 #: Yahoo 上回看几天的日线；90 个交易日需要留出余量，取 6 个月。
 YAHOO_RANGE: Final = "6mo"

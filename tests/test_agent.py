@@ -42,7 +42,12 @@ from mining_daily_agent.agent.nodes import (
     slugify,
 )
 from mining_daily_agent.agent.state import FetchPlan
-from mining_daily_agent.config import Config, default_report_url, reports_dir
+from mining_daily_agent.config import (
+    DEFAULT_REPORT_URL_BUILTIN,
+    Config,
+    default_report_url,
+    reports_dir,
+)
 from mining_daily_agent.models.news import NewsItem
 from mining_daily_agent.models.prices import PricePoint
 from mining_daily_agent.models.resources import ResourceCategory, ResourceItem, ResourceReport
@@ -194,6 +199,18 @@ def _report_payload() -> dict[str, object]:
             ),
         ],
     ).model_dump(mode="json")
+
+
+def _plain_news_item(**overrides: object) -> dict[str, object]:
+    """一条不含 ``.pdf`` 链接、也不带 report/resource 线索词的普通新闻。"""
+    defaults: dict[str, object] = {
+        "title": "Some unrelated headline",
+        "url": "https://example.com/plain-page",
+        "source": "Example",
+        "published_at": datetime(2026, 9, 18, tzinfo=UTC),
+        "summary": "Nothing about resources.",
+    }
+    return NewsItem.model_validate({**defaults, **overrides}).model_dump(mode="json")
 
 
 def _responses() -> dict[tuple[str, str], object]:
@@ -360,30 +377,80 @@ async def test_real_data_is_not_marked_as_degraded(
     assert DEGRADED_MARK not in document
 
 
-async def test_missing_report_url_is_reported_as_a_risk(
+async def test_default_annual_report_beats_hint_matched_news(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """新闻里没有 PDF 线索且未配置兜底 URL 时，跳过取数并留下提示，而不是编造数据。"""
+    """有确定性年报时，绝不能退回线索词命中的新闻页。
+
+    Google News 返回的条目几乎不是 .pdf，线索词命中的多是普通新闻网页（矿企名里带
+    "Resources" 极常见）。把它喂给 PDF 解析器只会解析失败再降级成 mock——挑到哪条
+    全看运气，每次结果都可能不同。这是本项目修过的一个真实缺陷。
+    """
     responses = _responses()
     responses[("news", "search")] = _ok(
         [
             NewsItem(
-                title="Some unrelated headline",
-                url="https://example.com/plain-page",
+                title="Raiden Resources eyes lithium exploration",
+                url="https://example.com/news-page",
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
-                summary="Nothing about resources.",
+                summary="Exploration update.",
             ).model_dump(mode="json")
         ]
     )
-    llm = _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
     pool = _FakePool(responses)
 
     await run_daily_brief(TOPIC, pool=pool)
 
-    assert ("pdf", "extract_resources") not in {(server, tool) for server, tool, _ in pool.calls}
-    prompt = llm.prompts[-1]
-    assert "DEFAULT_REPORT_URL" in prompt, "风险提示应传给合成节点"
+    pdf_call = next(call for call in pool.calls if call[:2] == ("pdf", "extract_resources"))
+    assert pdf_call[2] == {"pdf_url": DEFAULT_REPORT_URL_BUILTIN}
+
+
+async def test_configured_report_url_beats_the_builtin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEFAULT_REPORT_URL", "https://example.com/custom-annual.pdf")
+    responses = _responses()
+    # 新闻里不能有 .pdf 链接，否则第一级就命中了，到不了年报这一级。
+    responses[("news", "search")] = _ok([_plain_news_item()])
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    pool = _FakePool(responses)
+
+    await run_daily_brief(TOPIC, pool=pool)
+
+    pdf_call = next(call for call in pool.calls if call[:2] == ("pdf", "extract_resources"))
+    assert pdf_call[2] == {"pdf_url": "https://example.com/custom-annual.pdf"}
+
+
+async def test_hint_matched_news_is_the_last_resort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """保底分支：只有在没有确定性年报时才回落到线索词命中的新闻。
+
+    内置默认值存在时这条分支不可达，所以这里显式把 default_report_url 打成空串来覆盖它
+    ——保留这段逻辑，是为了让「确定性优先」这条原则写死在代码里而不是靠默认值巧合成立。
+    """
+    monkeypatch.setattr(nodes_module, "default_report_url", lambda: "")
+    responses = _responses()
+    responses[("news", "search")] = _ok(
+        [
+            NewsItem(
+                title="Some company annual resource report",
+                url="https://example.com/resource-summary",
+                source="Example",
+                published_at=datetime(2026, 9, 18, tzinfo=UTC),
+                summary="Resource statement.",
+            ).model_dump(mode="json")
+        ]
+    )
+    _install_llm(monkeypatch, PLAN_REPLY, SUMMARY_REPLY)
+    pool = _FakePool(responses)
+
+    await run_daily_brief(TOPIC, pool=pool)
+
+    pdf_call = next(call for call in pool.calls if call[:2] == ("pdf", "extract_resources"))
+    assert pdf_call[2] == {"pdf_url": "https://example.com/resource-summary"}
 
 
 # --- 场景 3：LLM 计划解析失败回退默认计划 ------------------------------------
@@ -622,12 +689,12 @@ def test_reports_dir_defaults_to_reports_relative_dir(
     assert reports_dir() == Path("reports")
 
 
-def test_default_report_url_is_empty_unless_configured(
+def test_default_report_url_falls_back_to_the_builtin_annual_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """故意没有非空默认值——硬编码一个假地址只会让 PDF 取数每次都失败。"""
+    """未配置时用内置年报——有确定性来源，才不至于每次挑到哪条新闻全看运气。"""
     monkeypatch.delenv("DEFAULT_REPORT_URL", raising=False)
-    assert default_report_url() == ""
+    assert default_report_url() == DEFAULT_REPORT_URL_BUILTIN
 
     monkeypatch.setenv("DEFAULT_REPORT_URL", " https://example.com/annual.pdf ")
     assert default_report_url() == "https://example.com/annual.pdf"
