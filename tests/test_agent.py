@@ -6,7 +6,9 @@ LLM 与连接池全部替换成假实现，不触网、不起子进程；简报�
 
 from __future__ import annotations
 
+import io
 import json
+import sys
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1131,6 +1133,32 @@ def test_cli_prints_the_brief(
     assert code == 0
     assert captured == ["Pilbara 锂矿"]
     assert "# 简报正文" in capsys.readouterr().out
+
+
+def test_cli_survives_a_gbk_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows 中文控制台默认 GBK，而简报里有 GBK 编不出的字符。
+
+    U+2011（``In‑situ``）、U+2019（``Fog’s Block``）直接来自资源报告原文，GBK 码表里
+    没有。不切 UTF-8 的话 ``print`` 抛 ``UnicodeEncodeError``：**文件已经落盘、退出码
+    却是非 0**，Windows 上的评审者会当成运行失败。
+    """
+
+    async def _fake(topic: str, pool: ToolCaller | None = None) -> str:
+        return "# 矿权日报 · Pilbara 锂矿\n- In‑situ、Fog’s Block\n"
+
+    buffer = io.BytesIO()
+    gbk_console = io.TextIOWrapper(buffer, encoding="gbk", errors="strict", newline="")
+    monkeypatch.setattr(cli_module, "run_daily_brief", _fake)
+    monkeypatch.setattr(sys, "stdout", gbk_console)
+    monkeypatch.setattr(sys, "stderr", gbk_console)
+
+    code = cli_module.main([])
+
+    gbk_console.flush()
+    assert code == 0, "打印不该让整条流程以非 0 退出"
+    text = buffer.getvalue().decode("utf-8")
+    assert "In‑situ" in text, "切到 UTF-8 后原样写出，不打折"
+    assert "Pilbara 锂矿" in text
 
 
 def test_cli_defaults_to_the_default_topic() -> None:

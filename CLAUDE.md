@@ -62,6 +62,10 @@ uv run python scripts/verify_pool.py
 - 采用 **src 布局**：代码放 `src/mining_daily_agent/`，`uv_build` 要求保持该结构。子包划分见「代码组织」。
 - 入口点：`mining_daily_agent.__main__:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
   **只有这一个** CLI 实现；改动它时 `tests/test_entrypoint.py` 会校验脚本目标没有分叉。
+- **`main()` 第一件事是把 stdout/stderr 切到 UTF-8**（`force_utf8_stdio()`）。Windows 中文
+  控制台默认 GBK，而简报正文里有从报告原文照抄的 U+2011（`In‑situ`）、U+2019
+  （`Fog’s Block`）——GBK 编不出，`print` 抛 `UnicodeEncodeError`：**文件已落盘、退出码
+  却是非 0**，Windows 上会被当成运行失败。新增终端输出时不要绕过这一步。
 - `pydantic` 已显式声明进 `dependencies`（此前只靠 `mcp` 传递依赖，属隐患）。
 
 ## 代码组织
