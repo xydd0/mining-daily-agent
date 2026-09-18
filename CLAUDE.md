@@ -4,15 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 当前状态
 
-新闻与 PDF 两条链路已打通（`models` → `providers` → `servers`），`client` 仍是空白：
+规则要求的**三个 MCP server 已全部实现**（`models` → `providers` → `servers`），`client` 仍是空白：
 
 - `src/mining_daily_agent/config.py` — 环境变量集中读取与校验，缺失时抛 `ConfigError`
-- `src/mining_daily_agent/models/news.py` — `NewsItem` / `Article`（pydantic）
-- `src/mining_daily_agent/models/resources.py` — `ResourceCategory` / `ResourceItem` / `ResourceReport`
-- `src/mining_daily_agent/providers/news/` — `base.py`（`NewsProvider` Protocol）、`rss.py`（真实实现，3 个 RSS 源）、`mock.py`（降级实现，8 条内置数据）
-- `src/mining_daily_agent/providers/pdf/` — `base.py`（`PdfProvider` Protocol）、`parser.py`（pdfplumber + 正则抽取）、`mock.py`（Pilgangoora 风格资源表）
-- `src/mining_daily_agent/servers/news_server.py` — `mining-news-mcp`：`search` / `fetch_article`
-- `src/mining_daily_agent/servers/pdf_server.py` — `mineral-pdf-mcp`：`extract_resources`
+- `models/news.py` — `NewsItem` / `Article`
+- `models/resources.py` — `ResourceCategory` / `ResourceItem` / `ResourceReport`
+- `models/prices.py` — `PricePoint` / `TrendSeries`
+- `providers/news/` — `base.py`（`NewsProvider` Protocol）、`rss.py`（3 个 RSS 源）、`mock.py`（8 条内置数据）
+- `providers/pdf/` — `base.py`（`PdfProvider` Protocol）、`parser.py`（pdfplumber + 正则抽取，支持表头单位推断）、`mock.py`（Pilgangoora 风格资源表）
+- `providers/prices/` — `base.py`（`PriceProvider` Protocol + 品种词表 + 走势计算）、`stooq.py`（Stooq→Yahoo 两源）、`mock.py`（4 品种合成序列）
+- `servers/news_server.py` — `mining-news-mcp`：`search` / `fetch_article`
+- `servers/pdf_server.py` — `mineral-pdf-mcp`：`extract_resources`
+- `servers/price_server.py` — `lme-price-mcp`：`get_price` / `get_trend`
 - `src/mining_daily_agent/__init__.py` 的 `main()` 仍是占位实现，待接入实际流程
 - 「代码组织」中的 `client` 是**目标结构，尚未创建**
 - **没有 CI**；`README.md` 仍为空文件
@@ -22,6 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv run python -m mining_daily_agent.servers.news_server
 uv run python -m mining_daily_agent.servers.pdf_server
+uv run python -m mining_daily_agent.servers.price_server
 ```
 
 `pyproject.toml` 里的依赖声明的是**意图**，不是已实现的架构。在补全代码前，不要假设「代码组织」中列出的任何子包或模块已存在——请先 `ls src/mining_daily_agent/` 确认。
@@ -32,7 +36,7 @@ uv run python -m mining_daily_agent.servers.pdf_server
 - **Python 3.12**（`.python-version` 与 `pyproject.toml` 的 `requires-python = ">=3.12"` 一致）。注意系统默认 `python` 是 3.14，务必通过 `uv run` 调用，不要裸跑 `python`。
 - 采用 **src 布局**：代码放 `src/mining_daily_agent/`，`uv_build` 要求保持该结构。子包划分见「代码组织」。
 - 入口点：`mining_daily_agent:main`（对应 `pyproject.toml` 的 `[project.scripts]`）。
-- **依赖卫生问题**：代码直接 `import pydantic`，但 `pydantic` **没有**在 `pyproject.toml` 中声明，目前完全依赖 `mcp` 的传递依赖。若上游哪天去掉它，import 会直接失败。建议补一条显式声明（需用户确认，此前被要求"不新增依赖"）。
+- `pydantic` 已显式声明进 `dependencies`（此前只靠 `mcp` 传递依赖，属隐患）。
 
 ## 代码组织
 
@@ -85,6 +89,22 @@ src/mining_daily_agent/
   `from mcp.server.mcpserver import MCPServer`。写 `from mcp.server.fastmcp import FastMCP` 会直接 ImportError。
 - **定义工具函数/模型的模块不能加 `from __future__ import annotations`**。MCP 注册工具时要解析真实类型注解来生成 JSON schema，注解被延迟求值会导致解析失败；pydantic 同理。`servers/news_server.py` 与 `models/news.py` 都因此刻意省略了这行，并写了注释说明。
 - **工具内故意抛的异常必须是 `ToolError`**（`mcp.server.mcpserver.exceptions`）。SDK 只原样转发 `ToolError` 的 message，其余异常一律被替换成 `Error executing tool xxx`，异常文本留在服务端。`InvalidArticleUrlError` 因此同时继承 `ValueError`（框架无关的入参语义）与 `ToolError`（消息可传递），不要"简化"成裸 `ValueError`——那会让提示信息静默消失。
+
+### 价格工具的代理品种陷阱（重要）
+
+`lme-price-mcp` 返回的**不是 LME 金属价**。LME 现货行情没有免费 API，真实源只能用
+**上市代理工具**（ETF / 矿业公司）的行情，单位是 `USD/share`，不是 `USD/t`。
+
+- 每个 `PricePoint` 的 `source` 都会写明 `proxy quote, not an LME <commodity> spot price`，
+  `unit` 也只会是 `USD/share`。**不要**在下游文案、摘要或报告里把它当作金属吨价引用。
+- 只有 mock 合成数据才是 `USD/t`，且 `source` 标注 `mock: synthesized series`。
+- 代理映射见 `providers/prices/stooq.py` 的 `PROXY_SYMBOLS`（lithium→LIT、nickel→VALE、
+  copper→COPX、cobalt→REMX）。原定的镍代理 JJN 已无数据，故改用 VALE。
+
+另：**Stooq 的 CSV 端点已被 JS 工作证明反爬挡住**，实测默认 UA 返回 404、浏览器 UA
+返回挑战页，任何非 JS 客户端都拿不到数据。实现保留 Stooq 为首选（万一其策略调整），
+由 Yahoo Finance 兜底。代价是**每次调用会先白跑约 5 秒**（三次 403 重试加重试退避）
+才切到 Yahoo——若嫌慢，把 `SOURCES` 的顺序对调即可，不必删 Stooq 实现。
 
 ## 提交规范
 
