@@ -85,11 +85,13 @@ flowchart TB
 ## 开发方式
 
 本项目全程由 **Claude Code CLI** 开发，底层模型经 **DeepSeek 的 Anthropic 兼容网关**接入。
-所有提交都带这条 trailer：
+由 Claude Code 编写的提交都带这条 trailer：
 
 ```
 Co-Authored-By: Claude Code <noreply@anthropic.com>
 ```
+
+（仓库里另有 6 个 GitHub 生成的合并提交与 1 条最初的项目基线提交，它们不带 trailer。）
 
 分工是：AI 写代码、人做裁决与验收。每一步的范围、取舍、是否放行都由仓库所有者决定；
 那些「看起来过了、其实没查」的坑（格式门禁、mypy 检查范围、假 CI 配置）也是在这种
