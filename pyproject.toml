@@ -33,6 +33,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
+    "reportlab>=5.0.1",
     "ruff>=0.16.7",
 ]
 
@@ -93,6 +94,11 @@ show_error_codes = true
 # 模型内部的「禁止裸 Any」由 ruff 的 ANN401 继续把关函数签名。
 module = ["mining_daily_agent.models.*"]
 disallow_any_explicit = false
+
+[[tool.mypy.overrides]]
+# reportlab 未提供 py.typed；它只在测试里用来现生成 PDF 夹具。
+module = ["reportlab", "reportlab.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # feedparser 既不提供 py.typed 也没有官方 stubs，只能整体放宽。

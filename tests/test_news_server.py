@@ -104,9 +104,7 @@ def test_search_defaults_to_one_day(monkeypatch: pytest.MonkeyPatch) -> None:
     ("requested", "expected"),
     [(30, 30), (1, 1), (31, 30), (999, 30), (0, 1), (-5, 1)],
 )
-def test_search_clamps_days(
-    monkeypatch: pytest.MonkeyPatch, requested: int, expected: int
-) -> None:
+def test_search_clamps_days(monkeypatch: pytest.MonkeyPatch, requested: int, expected: int) -> None:
     provider = _RecordingProvider()
     monkeypatch.setattr(news_server, "get_news_provider", lambda: provider)
 
