@@ -27,7 +27,6 @@ def get_news_provider() -> NewsProvider:
     try:
         return RssNewsProvider()
     except Exception as exc:  # 降级兜底刻意捕获一切初始化失败，不限于特定异常类型
-
         logger.warning(
             "真实新闻源初始化失败，降级到 MockNewsProvider：provider=RssNewsProvider error=%s: %s",
             type(exc).__name__,
