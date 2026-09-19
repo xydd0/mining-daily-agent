@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Final, Protocol
+from urllib.parse import urlparse
 
 from mcp.types import CallToolResult, TextContent
 from pydantic import BaseModel, ValidationError
@@ -649,7 +650,7 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
 
     article: Article | None = None
     if news:
-        article = await _fetch_article(pool, news[0], notes)
+        article = await _fetch_article(pool, _pick_article_target(news), notes)
 
     logger.info(
         "fetch_data 完成：news=%d trend=%s report=%s article=%s risks=%d",
@@ -666,6 +667,28 @@ async def fetch_data(state: BriefState) -> dict[str, object]:
         "resource_report": report,
         "risk_notes": notes,
     }
+
+
+#: Google News 的中转页域名。它的条目 ``link`` 是 JS 壳，抓回来正文 0 字符。
+GOOGLE_NEWS_HOST: Final = "news.google.com"
+
+
+def _is_google_news_url(url: str) -> bool:
+    """是不是 Google News 的中转链接。"""
+    return (urlparse(url).hostname or "").casefold() == GOOGLE_NEWS_HOST
+
+
+def _pick_article_target(news: list[NewsItem]) -> NewsItem:
+    """挑要抓正文的那一条：**优先发布方直链**。
+
+    Google News 的条目 link 是 ``news.google.com`` 的中转页（JS 壳），正文抓回来是空的；
+    Mining.com、Yahoo 这类源给的是直链，抓得到。所以先挑非 Google 域的，全是中转链接时
+    才回退到第一条——**顺序与降级逻辑都不变**，只是把「能不能抓到正文」纳入选择。
+    """
+    for item in news:
+        if not _is_google_news_url(item.url):
+            return item
+    return news[0]
 
 
 async def _fetch_article(pool: ToolCaller, item: NewsItem, notes: list[str]) -> Article | None:
