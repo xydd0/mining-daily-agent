@@ -249,6 +249,24 @@ Limitations 小节的引用来源。写下来是为了挡住两种误读：以�
 分类别数字并不标注属于哪张表。要更细需要给 `ResourceItem` 加项目 / 分块归属字段，
 本轮没做。
 
+### 正文能不能拿到，取决于源的链接形态
+
+`fetch_article` 的结果完全取决于 `search` 给的是**发布方直链**还是**中转页**：
+
+| 源 | 链接形态 | 正文 |
+|---|---|---|
+| Bing News | 发布方直链 | 可抓 —— **但见下** |
+| Google News | `news.google.com/rss/articles/…` 中转页（JS 壳） | **抓不到**（实测 0 字符） |
+| Mining.com | 发布方直链 | 可抓（**必须带浏览器 UA**，否则 403） |
+| Yahoo Finance | 发布方直链 | 可抓 |
+
+**实测补充（2026-09）**：Bing News 的 RSS 端点**在当前网络下不返回 RSS**——`www.bing.com`
+被 302 到 `cn.bing.com`，带不带 UA、加不加 `cc`/`mkt` 都落到首页 HTML。于是降级链照常往下走
+（不会中断），但**「正文为空」的问题在本环境里并没有被 Bing 解决**：Google News 排在第二、
+又能返回条目，第三位的 Mining.com 因此在多数情况下**根本没被用到**。
+要让正文真正可用，得把 Mining.com 这类直链源提到 Google News 前面（或按「能否拿到正文」
+而不是固定顺序选源）。
+
 ### Google News 的文章正文取不到
 
 Google News RSS 的 `<link>` **不是发布方 URL**，而是

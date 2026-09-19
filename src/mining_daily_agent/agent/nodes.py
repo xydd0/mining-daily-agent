@@ -23,6 +23,7 @@ from mining_daily_agent.config import default_report_url, reports_dir
 from mining_daily_agent.models.news import Article, NewsItem
 from mining_daily_agent.models.prices import TrendSeries
 from mining_daily_agent.models.resources import ResourceCategory, ResourceReport
+from mining_daily_agent.providers.news.rss import query_terms
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -138,6 +139,23 @@ GENERIC_SUBJECT_TOKENS: Final[frozenset[str]] = frozenset(
         "with",
     }
 )
+#: 判相关性用的**领域词**。与主体词共现才算讲的是这个主题——只共享主体词不算
+#: （实测 "Pilbara Gold" 这类共享地名的异矿种新闻就会被误放进来）。
+#: 刻意**不含** mining / market / resource 这类泛词：它们与主体词共现说明不了什么。
+DOMAIN_WORDS: Final[tuple[str, ...]] = (
+    "lithium",
+    "spodumene",
+    "li2o",
+    "锂",
+    "锂矿",
+    "锂辉石",
+    "nickel",
+    "copper",
+    "cobalt",
+    "镍",
+    "铜",
+    "钴",
+)
 #: 请求式主题里的措辞，压「主体」时去掉。
 _TOPIC_FILLER: Final[tuple[str, ...]] = (
     "给我",
@@ -217,9 +235,10 @@ REQUIRED_SECTIONS: Final[tuple[str, ...]] = (
 #:
 #: 各条导语逐条写「该报道正文未能抓取」既啰嗦又抢戏，收成一句放在小节末尾说明一次。
 #: 风险提示里对应的那条保留——那是披露，与小节注释不是一回事。
-NEWS_BODY_NOTE: Final = (
-    "注：本期新闻源经 Google News 中转页，正文未能抓取，各条导语基于标题与摘要撰写。"
-)
+#:
+#: 措辞刻意**不点具体新闻源**：早先写死「经 Google News 中转页」，换成 Bing 主源之后
+#: 那句话就成了假的——正文抓不到的原因不止一种。
+NEWS_BODY_NOTE: Final = "注：本期新闻源未能抓取到正文，各条导语基于标题与摘要撰写。"
 
 #: 重试时追加的更强硬指令。上一次的输出没能让简报成篇，这一次必须只吐合规 JSON。
 _STRICT_RETRY_INSTRUCTION: Final = (
@@ -398,10 +417,41 @@ def subject_tokens(topic: str, plan: FetchPlan) -> set[str]:
     }
 
 
+def subject_phrases(plan: FetchPlan) -> list[str]:
+    """主体**短语**：原始关键词里 ≥2 个词的那些（如 ``pilbara minerals``）。
+
+    整串命中即算相关——这是最强的信号。
+    """
+    return [term.casefold() for term in query_terms(plan.keywords) if len(term.split()) >= 2]
+
+
+def domain_words(plan: FetchPlan) -> set[str]:
+    """领域词：与主体词**共现**才算讲的是这个主题。"""
+    return {*DOMAIN_WORDS, plan.commodity.casefold()}
+
+
+def _is_relevant(item: NewsItem, phrases: list[str], tokens: set[str], domains: set[str]) -> bool:
+    """放行条件（任一即可）：
+
+    a. 标题或摘要里出现**完整的主体短语**（``pilbara minerals``）；
+    b. 主体词与领域词**共现**（``pilbara`` + ``lithium``）。
+
+    只命中主体词不算。实测：拿 "Pilbara" 检索回来的条目里有
+    「Pilbara Gold (ASX:PGL) 公布 Roe Hills 钻探结果」——共享了 "Pilbara" 这个词，
+    讲的是金矿，与锂矿主题无关。
+    """
+    haystack = f"{item.title} {item.summary}".casefold()
+    if any(phrase in haystack for phrase in phrases):
+        return True
+    has_subject = any(token in haystack for token in tokens)
+    has_domain = any(word in haystack for word in domains)
+    return has_subject and has_domain
+
+
 def filter_relevant_news(
     news: list[NewsItem], topic: str, plan: FetchPlan
 ) -> tuple[list[NewsItem], int]:
-    """只保留**讲主题主体**的条目。
+    """只保留**讲主题主体**的条目，判定规则见 :func:`_is_relevant`。
 
     Returns:
         ``(保留的条目, 被剔除的条数)``。主体词一个都挑不出来时不筛（无从判断，
@@ -413,7 +463,7 @@ def filter_relevant_news(
     kept = [
         item
         for item in news
-        if any(token in f"{item.title} {item.summary}".casefold() for token in tokens)
+        if _is_relevant(item, subject_phrases(plan), tokens, domain_words(plan))
     ]
     return kept, len(news) - len(kept)
 
@@ -631,12 +681,13 @@ async def _fetch_article(pool: ToolCaller, item: NewsItem, notes: list[str]) -> 
         notes.append(f"正文抓取失败，该条导语改用标题与摘要：{type(exc).__name__}: {exc}")
         return None
 
+    if article.degraded:
+        # 降级回来的是**示例正文**，不是这篇文章。喂给 LLM 等于让它照着编。
+        notes.append("正文抓取失败，已降级为示例正文（并非真实报道），该条导语改用标题与摘要。")
+        return None
     if not article.text.strip():
-        # 实测：Google News 的 <link> 是 JS 中转页，返回 200 但正文 0 字符。
-        notes.append(
-            "抓回的正文为空（Google News 的链接是 JS 中转页，实测正文 0 字符），"
-            "该条导语改用标题与摘要。"
-        )
+        notes.append("抓回的正文为空，该条导语改用标题与摘要。")
+        return None
     if len(article.text) > ARTICLE_EXCERPT_CHARS:
         article = article.model_copy(update={"text": article.text[:ARTICLE_EXCERPT_CHARS]})
     return article
