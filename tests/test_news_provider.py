@@ -175,7 +175,7 @@ def test_search_parses_feed_and_filters_by_days(monkeypatch: pytest.MonkeyPatch)
     items = RssNewsProvider().search("pilbara lithium", days=1)
 
     assert len(items) == 1
-    assert items[0].source == "Bing News"
+    assert items[0].source == "Google News"
     assert items[0].summary == "Booming lithium output"
 
 
@@ -188,10 +188,9 @@ def test_search_drops_items_older_than_requested_window(
         RssNewsProvider().search("pilbara lithium", days=1)
 
 
-def test_source_order_is_bing_google_mining_yahoo() -> None:
-    """Bing 在首位、Google News 第二：正文能不能抓到就看这个顺序。"""
+def test_source_order_is_google_mining_yahoo() -> None:
+    """Google News 检索面最广所以排第一，Mining.com 是唯一稳定可用的直链源。"""
     assert [source.name for source in rss.SOURCES] == [
-        "Bing News",
         "Google News",
         "Mining.com",
         "Yahoo Finance",
@@ -199,12 +198,12 @@ def test_source_order_is_bing_google_mining_yahoo() -> None:
 
 
 def test_search_falls_through_to_next_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    """前两个源都挂了就落到 Mining.com——降级链逐级往下走，任一命中即返回。"""
+    """Google News 挂了就落到 Mining.com——降级链逐级往下走，任一命中即返回。"""
     seen_urls: list[str] = []
 
     def _get(url: str) -> httpx.Response:
         seen_urls.append(url)
-        if "bing.com" in url or "news.google.com" in url:
+        if "news.google.com" in url:
             raise httpx.ConnectError("dns failure")
         return _response(url, _feed(age_days=0.1))
 
@@ -215,12 +214,11 @@ def test_search_falls_through_to_next_source(monkeypatch: pytest.MonkeyPatch) ->
 
     assert len(items) == 1
     assert items[0].source == "Mining.com"
-    assert any("bing.com" in url for url in seen_urls)
     assert any("news.google.com" in url for url in seen_urls)
     assert any("mining.com/feed" in url for url in seen_urls)
 
 
-def test_search_asks_bing_with_a_url_encoded_query(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_url_encodes_the_query(monkeypatch: pytest.MonkeyPatch) -> None:
     """关键词要 URL 编码后填进模板，空格与 OR 都不能原样丢进 query string。"""
     seen_urls: list[str] = []
     monkeypatch.setattr(rss, "_http_get", _stub_get(_feed(age_days=0.1), seen=seen_urls))
@@ -228,32 +226,8 @@ def test_search_asks_bing_with_a_url_encoded_query(monkeypatch: pytest.MonkeyPat
     RssNewsProvider().search("Pilbara Minerals OR Pilgangoora", days=1)
 
     assert seen_urls, "应当请求过"
-    assert "bing.com/news/search" in seen_urls[0]
+    assert "news.google.com/rss/search" in seen_urls[0]
     assert "q=Pilbara+Minerals+OR+Pilgangoora" in seen_urls[0]
-    assert "format=RSS" in seen_urls[0]
-
-
-def test_bing_entries_are_parsed_like_any_other_feed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bing 的 RSS 同样是 title/link/description/pubDate 结构，沿用同一套解析。"""
-    monkeypatch.setattr(
-        rss,
-        "_http_get",
-        _stub_get(
-            _feed(
-                age_days=0.1,
-                title="Pilbara Minerals lifts output guidance",
-                summary_html="&lt;p&gt;Spodumene &lt;b&gt;output&lt;/b&gt; rose.&lt;/p&gt;",
-            )
-        ),
-    )
-
-    items = RssNewsProvider().search("Pilbara Minerals", days=7)
-
-    assert len(items) == 1
-    assert items[0].source == "Bing News"
-    assert items[0].title == "Pilbara Minerals lifts output guidance"
-    assert items[0].summary == "Spodumene output rose.", "description 要走同一套清洗与截断"
-    assert len(items[0].summary) <= rss.SUMMARY_MAX_CHARS
 
 
 def test_search_applies_local_keyword_filter_for_feeds_without_query(
@@ -262,7 +236,7 @@ def test_search_applies_local_keyword_filter_for_feeds_without_query(
     """带查询的源无结果时落到 Mining.com，本地关键词过滤应生效。"""
 
     def _get(url: str) -> httpx.Response:
-        if "bing.com" in url or "news.google.com" in url:
+        if "news.google.com" in url:
             return _response(url, "<rss version='2.0'><channel/></rss>")
         return _response(
             url,

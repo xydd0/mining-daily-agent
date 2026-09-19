@@ -72,16 +72,12 @@ class RssSource:
 
 #: 按优先级排列的 RSS 源，顺序即尝试顺序，任一命中即返回。
 #:
-#: **Bing News 在首位，原因是正文**：Google News 的条目 ``link`` 是
-#: ``news.google.com/rss/articles/…`` 的中转页（JS 壳），``fetch_article`` 抓回来
-#: 正文 **0 字符**——摘要能用，正文永远拿不到（见 docs/architecture.md 的已知取舍）。
-#: Bing 返回的是**发布方直链**，正文抓得到。
+#: 正文能不能拿到取决于源的**链接形态**：Google News 的条目 ``link`` 是
+#: ``news.google.com/rss/articles/…`` 的中转页（JS 壳），``fetch_article`` 抓回来正文
+#: 0 字符；Mining.com 与 Yahoo 给的是**发布方直链**，正文抓得到。但 Google News 的
+#: 检索质量最好，所以它仍然排第一，Mining.com（**必须带浏览器 UA**，否则 403）
+#: 作为唯一稳定可用的直链源排第二（见 docs/architecture.md 的已知取舍）。
 SOURCES: Final[tuple[RssSource, ...]] = (
-    RssSource(
-        name="Bing News",
-        url="https://www.bing.com/news/search?q={query}&format=RSS",
-        query_in_url=True,
-    ),
     RssSource(
         name="Google News",
         url="https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
