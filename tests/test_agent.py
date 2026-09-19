@@ -43,6 +43,7 @@ from mining_daily_agent.agent.nodes import (
     build_citations,
     default_plan,
     fetch_data,
+    filter_relevant_news,
     parse_plan,
     planner,
     report_path,
@@ -480,7 +481,7 @@ async def test_hint_matched_news_is_the_last_resort(
     responses[("news", "search")] = _ok(
         [
             NewsItem(
-                title="Pilbara company annual resource report",
+                title="Pilbara company annual lithium resource report",
                 url="https://example.com/resource-summary",
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
@@ -635,7 +636,7 @@ async def test_pdf_link_is_preferred_over_hint_matching(
                 summary="s",
             ).model_dump(mode="json"),
             NewsItem(
-                title="Pilbara annual report",
+                title="Pilbara lithium annual report",
                 url="https://example.com/annual.PDF",  # 真 PDF，大小写不敏感
                 source="Example",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
@@ -919,7 +920,7 @@ async def test_irrelevant_news_is_filtered_out(monkeypatch: pytest.MonkeyPatch) 
                 url=NEWS_URL,
                 source="Example News",
                 published_at=datetime(2026, 9, 18, tzinfo=UTC),
-                summary="Output rose.",
+                summary="Lithium output rose.",
             ).model_dump(mode="json"),
         ]
     )
@@ -930,6 +931,88 @@ async def test_irrelevant_news_is_filtered_out(monkeypatch: pytest.MonkeyPatch) 
     assert "Pilbara Minerals lifts output" in document
     assert "Raiden Resources" not in document, "无关条目不进简报"
     assert "与主题主体" in document, "剔除动作要在风险提示里留痕"
+
+
+# --- 相关性判定（整词组 / 领域共现）------------------------------------------
+
+
+def _plan(keywords: str = "Pilbara Minerals OR lithium") -> FetchPlan:
+    return FetchPlan(keywords=keywords, days=7, commodity="lithium")
+
+
+def _news(title: str, summary: str = "") -> NewsItem:
+    return NewsItem(
+        title=title,
+        url="https://example.com/a",
+        source="Example",
+        published_at=datetime(2026, 9, 18, tzinfo=UTC),
+        summary=summary,
+    )
+
+
+def test_relevance_keeps_a_full_subject_phrase() -> None:
+    """整串主体短语命中即算相关——这是最强信号。"""
+    item = _news("Pilbara Minerals lifts output guidance")
+
+    kept, dropped = filter_relevant_news([item], TOPIC, _plan())
+
+    assert kept == [item]
+    assert dropped == 0
+
+
+def test_relevance_keeps_subject_and_domain_co_occurrence() -> None:
+    """主体词与领域词共现也算——不必出现完整短语。"""
+    item = _news("Hancock expands Pilbara lithium tenement footprint")
+
+    kept, _ = filter_relevant_news([item], TOPIC, _plan())
+
+    assert kept == [item]
+
+
+def test_relevance_drops_a_shared_place_name_without_the_domain() -> None:
+    """只有共享地名、没有领域共现的条目必须剔除。
+
+    实测："Pilbara Gold (ASX:PGL) 公布 Roe Hills 钻探结果" —— 共享 "Pilbara" 这个词，
+    讲的是金矿。只按主体词放行的话它会被当成本主题的新闻写进简报。
+    """
+    item = _news("Pilbara Gold confirms drilling results at Roe Hills", "Gold intercepts returned.")
+
+    kept, dropped = filter_relevant_news([item], TOPIC, _plan())
+
+    assert kept == []
+    assert dropped == 1
+
+
+def test_relevance_keeps_everything_when_no_subject_token_is_found() -> None:
+    """主体词一个都挑不出来时不筛——凭一个空集合把新闻清空毫无道理。"""
+    items = [
+        _news("Copper mine expands output", "Copper concentrator ramp-up continues."),
+        _news("Pilbara Gold confirms drilling results", "Gold intercepts returned."),
+    ]
+
+    # 主题与关键词里只剩泛词（lithium / market），挑不出任何主体词。
+    kept, dropped = filter_relevant_news(items, "铜矿", _plan("lithium market"))
+
+    assert kept == items
+    assert dropped == 0
+
+
+async def test_a_degraded_article_is_not_fed_to_the_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """降级回来的「示例正文」不是这篇文章——喂给 LLM 等于让它照着编。
+
+    与「抓回空正文」同等对待：都不进资料块，并在风险提示里说明。
+    """
+    responses = _responses()
+    responses[("news", "fetch_article")] = _ok(
+        _article_payload(degraded=True, text="（mock 降级数据：未内置该 URL 的正文。）")
+    )
+    llm = _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+
+    document = await run_daily_brief(TOPIC, pool=_FakePool(responses))
+
+    assert "已降级为示例正文" in document, "降级要留痕"
+    assert NEWS_BODY_NOTE in document, "正文视为未抓到"
+    assert "未内置该 URL 的正文" not in llm.prompts[-1], "示例正文不得进入资料块"
 
 
 async def test_headlines_are_never_truncated_with_an_ellipsis(

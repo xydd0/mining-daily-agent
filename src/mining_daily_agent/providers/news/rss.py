@@ -23,7 +23,7 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 
 from mining_daily_agent.models.news import Article, NewsItem
-from mining_daily_agent.providers import net
+from mining_daily_agent.providers import BROWSER_USER_AGENT, net
 from mining_daily_agent.providers.news.base import NewsProvider
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,9 @@ SUMMARY_MAX_CHARS: Final = 500
 #: ``fetch_article`` 返回正文的字符上限。真实文章可达数十万字符，原样返回会把调用方
 #: （尤其 LLM）的上下文撑爆。
 ARTICLE_TEXT_MAX_CHARS: Final = 8000
+#: 正文短于这个长度即视为**没抓到**（JS 壳、登录墙、反爬页都会返回一个空壳页面）。
+#: 宁可报失败走降级路径，也不要返回一个看着成功的空正文。
+MIN_ARTICLE_CHARS: Final = 50
 
 _TAG_RE: Final = re.compile(r"<[^>]+>")
 _WHITESPACE_RE: Final = re.compile(r"\s+")
@@ -67,7 +70,13 @@ class RssSource:
     query_in_url: bool
 
 
-#: 按优先级排列的 RSS 源，顺序即尝试顺序。
+#: 按优先级排列的 RSS 源，顺序即尝试顺序，任一命中即返回。
+#:
+#: 正文能不能拿到取决于源的**链接形态**：Google News 的条目 ``link`` 是
+#: ``news.google.com/rss/articles/…`` 的中转页（JS 壳），``fetch_article`` 抓回来正文
+#: 0 字符；Mining.com 与 Yahoo 给的是**发布方直链**，正文抓得到。但 Google News 的
+#: 检索质量最好，所以它仍然排第一，Mining.com（**必须带浏览器 UA**，否则 403）
+#: 作为唯一稳定可用的直链源排第二（见 docs/architecture.md 的已知取舍）。
 SOURCES: Final[tuple[RssSource, ...]] = (
     RssSource(
         name="Google News",
@@ -90,14 +99,19 @@ SOURCES: Final[tuple[RssSource, ...]] = (
 def _http_get(url: str) -> httpx.Response:
     """发出单次 GET。
 
-    这是本模块唯一的 HTTP 接缝：超时、大小上限与安全护栏都在这里统一设置，
+    这是本模块唯一的 HTTP 接缝：超时、请求头、大小上限与安全护栏都在这里统一设置，
     测试也在这里替换。正文走 5 MB 上限——HTML 正文不该有 PDF 那么大。
+
+    **必须带浏览器 UA**：Mining.com 对非浏览器 UA 直接 403（实测裸请求 403、带 UA 拿到
+    完整 RSS）。这一条直接影响降级链的可用性——Mining.com 是少数给**发布方直链**的源，
+    拿不到它就等于拿不到正文。
     """
     return net.get_capped(
         url,
         max_bytes=net.HTML_MAX_BYTES,
         source_name="新闻页",
         timeout=HTTP_TIMEOUT_SECONDS,
+        headers={"User-Agent": BROWSER_USER_AGENT, "Accept": "application/rss+xml,text/html,*/*"},
     )
 
 
@@ -289,6 +303,11 @@ class RssNewsProvider(NewsProvider):
             _WHITESPACE_RE.sub(" ", body.get_text(separator=" ", strip=True)).strip(),
             ARTICLE_TEXT_MAX_CHARS,
         )
+        if len(text) < MIN_ARTICLE_CHARS:
+            # 抓回来的不是一篇正文（JS 壳、登录墙、反爬页）。**当成失败**而不是返回
+            # 一个空壳：上层据此走既有的降级路径，与其它抓取失败一视同仁。
+            msg = f"正文过短（{len(text)} 字符 < {MIN_ARTICLE_CHARS}），多半是 JS 壳或反爬页：{url}"
+            raise RssFetchError(msg)
 
         return Article(
             title=title or url,
