@@ -295,6 +295,38 @@ async def test_full_pipeline_produces_markdown_with_sources_section(
     assert "test-source" in document, "价格来源应进引用源"
 
 
+async def test_the_article_target_prefers_a_direct_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有条目给发布方直链时，优先抓它——Google News 的中转页正文永远是空的。"""
+    responses = _responses()
+    responses[("news", "search")] = _ok(
+        [
+            NewsItem(
+                title="Pilbara lithium output rises",
+                url="https://news.google.com/rss/articles/CBMiabc?oc=5",
+                source="Google News",
+                published_at=datetime(2026, 9, 18, tzinfo=UTC),
+                summary="Lithium output rose.",
+            ).model_dump(mode="json"),
+            NewsItem(
+                title="Pilbara Minerals lifts guidance",
+                url="https://www.mining.com/pilbara-minerals-lifts-guidance/",
+                source="Mining.com",
+                published_at=datetime(2026, 9, 18, tzinfo=UTC),
+                summary="Lithium guidance lifted.",
+            ).model_dump(mode="json"),
+        ]
+    )
+    _install_llm(monkeypatch, PLAN_REPLY, LEDES_REPLY)
+    pool = _FakePool(responses)
+
+    await run_daily_brief(TOPIC, pool=pool)
+
+    article_call = next(call for call in pool.calls if call[:2] == ("news", "fetch_article"))
+    assert article_call[2] == {"url": "https://www.mining.com/pilbara-minerals-lifts-guidance/"}
+
+
 async def test_full_pipeline_calls_every_expected_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
